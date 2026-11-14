@@ -1,0 +1,8 @@
+{
+  "appId": "com.sleepmonitor.app",
+  "appName": "Sleep Monitor",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#0b0f17"
+  }
+}

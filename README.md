@@ -13,7 +13,17 @@ Everything stays on your phone in the browser's storage. Nothing is uploaded.
 
 > ⚠️ **Not a medical device.** A microphone can't measure airflow or blood oxygen, so it misses some apneas and some pauses it reports aren't apneas. Use it to decide whether to see a doctor and to show them what happens at night. A sleep study is the only real diagnosis.
 
-## Running it
+## Download the Android app
+
+**[⬇ Download SleepMonitor.apk](https://github.com/veryniceparts/sleep/releases/latest/download/SleepMonitor.apk)**
+
+Open the link on your Android phone, open the downloaded file and tap **Install**. If Android asks, allow your browser to *install unknown apps*. The first time you tap Start, allow microphone access.
+
+A new APK is built automatically by GitHub Actions on every push (see *Actions* and *Releases*). All builds are signed with the same key, so a new version installs over the old one and keeps your recordings. In the app, **Download** buttons open Android's share sheet, so you can save files to Files or Drive, or send them by email or a messaging app.
+
+iPhone can't install APKs. Use the web version below and *Add to Home Screen*.
+
+## Running it as a web app
 
 Browsers only allow microphone access over **HTTPS** (or `localhost`), so host the folder on any static HTTPS host:
 
@@ -71,8 +81,21 @@ Levels are relative: 0 dB is digital silence and about 100 dB is the loudest the
 
 Delete old nights in History.
 
+## Building the Android app yourself
+
+Requires Node 22+, JDK 21 and the Android SDK:
+
+```
+npm install
+npm run build:android   # → android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+The Android project is a [Capacitor](https://capacitorjs.com) wrapper around the same web files (`scripts/build-web.mjs` copies them into `www/`).
+
 ## Files
 
 - `index.html`, `styles.css`: the user interface
 - `app.js`: audio capture, level detection, clip recording, pause detection, IndexedDB storage, charts
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline support and installing as an app
+- `android/`, `capacitor.config.json`, `package.json`: Android app wrapper
+- `.github/workflows/android.yml`: builds the APK and publishes it as a GitHub release

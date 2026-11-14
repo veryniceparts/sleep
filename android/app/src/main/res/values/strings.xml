@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Sleep Monitor</string>
+    <string name="title_activity_main">Sleep Monitor</string>
+    <string name="package_name">com.sleepmonitor.app</string>
+    <string name="custom_url_scheme">com.sleepmonitor.app</string>
+</resources>

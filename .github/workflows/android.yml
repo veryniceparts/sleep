@@ -1,0 +1,68 @@
+name: Build Android app
+
+on:
+  push:
+    paths-ignore: ['README.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Copy web app into the Android project
+        run: |
+          npm run build:web
+          npx cap sync android
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk ../SleepMonitor.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SleepMonitor-apk
+          path: SleepMonitor.apk
+
+      - name: Publish release (download link)
+        if: github.ref_name == github.event.repository.default_branch
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: Sleep Monitor ${{ env.VERSION_NAME }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: SleepMonitor.apk
+          body: |
+            Android app for monitoring sleep apnea sounds.
+
+            **Install:** open this page on your Android phone, tap **SleepMonitor.apk**, then open the downloaded file.
+            If Android asks, allow your browser to *install unknown apps*.
+            Updates install over the previous version and keep your recordings.
+
+            Built from ${{ github.sha }}.

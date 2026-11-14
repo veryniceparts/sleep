@@ -408,12 +408,43 @@ const fmtDate = (t) => new Date(t).toLocaleString([], { weekday: 'short', month:
 const rate = (n, ms) => (ms >= 600000 ? (n / (ms / 3600000)).toFixed(1) : '–');
 const fileStamp = (t) => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; };
 
-function download(blob, name) {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+// Running inside the Android app (Capacitor) rather than a browser?
+const NATIVE = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+const plugin = (name) => (NATIVE && window.Capacitor.Plugins ? window.Capacitor.Plugins[name] : null);
+
+const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(String(r.result).split(',')[1]);
+  r.onerror = () => reject(r.error);
+  r.readAsDataURL(blob);
+});
+
+// Save files: browser download, or in the Android app write them to a temp file and open the share sheet
+// (save to Files / Drive, send by email, WhatsApp, ...).
+async function downloadMany(items) {
+  const fs = plugin('Filesystem'), share = plugin('Share');
+  if (fs && share) {
+    try {
+      const files = [];
+      for (const { blob, name } of items) {
+        const r = await fs.writeFile({ path: name, data: await blobToBase64(blob), directory: 'CACHE' });
+        files.push(r.uri);
+      }
+      await share.share({ title: items.length === 1 ? items[0].name : `${items.length} recordings`, files });
+    } catch (e) {
+      if (!/cancel/i.test(e && e.message)) alert('Could not save: ' + (e && e.message));
+    }
+    return;
+  }
+  for (const { blob, name } of items) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    if (items.length > 1) await new Promise((r) => setTimeout(r, 400));
+  }
 }
+const download = (blob, name) => downloadMany([{ blob, name }]);
 
 function setupCanvas(cv) {
   const dpr = window.devicePixelRatio || 1;
@@ -431,7 +462,14 @@ const yOf = (db, h) => h - ((Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / 
 // ---------------------------------------------------------------- monitor UI
 let wakeLock = null;
 async function keepAwake() {
+  const ka = plugin('KeepAwake');
+  if (ka) { ka.keepAwake().catch(() => {}); return; }
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+function allowSleep() {
+  const ka = plugin('KeepAwake');
+  if (ka) ka.allowSleep().catch(() => {});
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && Monitor.running) keepAwake();
@@ -504,7 +542,7 @@ $('btnStop').onclick = async () => {
   const s = await Monitor.stop();
   $('btnStop').disabled = false; $('btnStop').hidden = true; $('btnStart').hidden = false; $('btnNight').disabled = true;
   $('stState').textContent = 'Stopped'; $('stState').style.color = '';
-  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  allowSleep();
   if (s) alert(`Saved: ${fmtDur(s.end - s.start)}, ${s.clips.length} clips, ${s.events.length} breathing pauses.\nSee the History tab.`);
 };
 
@@ -702,11 +740,11 @@ function renderSession(s) {
       download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
     };
     el.querySelector('.btn-dlall').onclick = async () => {
-      for (const c of view.clips) { download(c.blob, `sleep_${fileStamp(c.start)}.wav`); await new Promise((r) => setTimeout(r, 300)); }
+      if (view.clips.length) await downloadMany(view.clips.map((c) => ({ blob: c.blob, name: `sleep_${fileStamp(c.start)}.wav` })));
     };
     el.querySelector('.btn-dlfull').onclick = async () => {
-      if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Download them all?`)) return;
-      for (const g of view.segs) { download(g.blob, `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}`); await new Promise((r) => setTimeout(r, 400)); }
+      if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Save them all?`)) return;
+      await downloadMany(view.segs.map((g) => ({ blob: g.blob, name: `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}` })));
     };
     el.querySelector('.btn-delfull').onclick = async () => {
       if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(s))})? Saved clips and the graph are kept.`)) return;
@@ -1202,6 +1240,6 @@ class NightView {
 fillSettings();
 drawLive();
 window.addEventListener('beforeunload', (e) => { if (Monitor.running) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
-if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+if ('serviceWorker' in navigator && location.protocol !== 'file:' && !NATIVE) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
