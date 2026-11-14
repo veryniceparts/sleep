@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0f17">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Sleep Apnea Monitor</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>Sleep Monitor</h1>
+    <nav>
+      <button class="tab active" data-tab="monitor">Monitor</button>
+      <button class="tab" data-tab="history">History</button>
+      <button class="tab" data-tab="settings">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- MONITOR -->
+    <section id="monitor" class="panel active">
+      <div class="meter-wrap">
+        <div class="level-readout"><span id="levelNow">--</span><small> dB</small></div>
+        <div class="meter">
+          <div id="meterBar" class="meter-bar"></div>
+          <div id="meterFloor" class="meter-mark floor" title="Noise floor"></div>
+          <div id="meterThreshold" class="meter-mark threshold" title="Recording threshold"></div>
+        </div>
+        <canvas id="liveChart" height="120"></canvas>
+      </div>
+
+      <label class="slider">
+        <span>Recording threshold: <b id="thresholdVal">60</b> dB</span>
+        <input id="thresholdQuick" type="range" min="20" max="100" step="1" value="60">
+      </label>
+
+      <div class="status-grid">
+        <div><span class="k">Status</span><span id="stState" class="v">Idle</span></div>
+        <div><span class="k">Elapsed</span><span id="stElapsed" class="v">0:00:00</span></div>
+        <div><span class="k">Saved clips</span><span id="stClips" class="v">0</span></div>
+        <div><span class="k">Breathing pauses</span><span id="stEvents" class="v">0</span></div>
+        <div><span class="k">Pauses / hour</span><span id="stRate" class="v">–</span></div>
+        <div><span class="k">Noise floor</span><span id="stFloor" class="v">–</span></div>
+      </div>
+
+      <div class="actions">
+        <button id="btnStart" class="primary big">Start monitoring</button>
+        <button id="btnStop" class="danger big" hidden>Stop</button>
+      </div>
+      <div class="actions">
+        <button id="btnCalibrate">Auto-set threshold (10 s quiet room)</button>
+        <button id="btnNight" disabled>Night mode (dark screen)</button>
+      </div>
+
+      <p class="hint">Put the phone 0.5–1 m from your head, plugged into a charger, and keep this page open.
+        The screen stays awake while monitoring. Night mode turns the screen black but keeps recording.</p>
+      <p class="disclaimer">⚠️ This is not a medical device and cannot diagnose sleep apnea. Use the recordings to
+        talk to a doctor; a sleep study is the only reliable diagnosis.</p>
+    </section>
+
+    <!-- HISTORY -->
+    <section id="history" class="panel">
+      <div class="row between">
+        <h2>Nights</h2>
+        <span id="storageInfo" class="muted"></span>
+      </div>
+      <div id="sessionList"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="settings" class="panel">
+      <h2>Recording</h2>
+      <label class="field"><span>Threshold (dB): sounds louder than this are saved</span>
+        <input type="number" id="setThreshold" min="20" max="100" step="1"></label>
+      <label class="field"><span>Pre-roll (s): audio kept from before the sound started</span>
+        <input type="number" id="setPreRoll" min="0" max="15" step="1"></label>
+      <label class="field"><span>Stop after quiet for (s)</span>
+        <input type="number" id="setPostRoll" min="1" max="30" step="1"></label>
+      <label class="field"><span>Max clip length (s)</span>
+        <input type="number" id="setMaxClip" min="5" max="300" step="5"></label>
+
+      <h2>Breathing-pause (apnea) detection</h2>
+      <label class="field"><span>Minimum pause length (s). Clinical apnea is ≥ 10 s</span>
+        <input type="number" id="setApneaGap" min="5" max="60" step="1"></label>
+      <label class="field"><span>Ignore pauses longer than (s). These are probably not breathing pauses</span>
+        <input type="number" id="setApneaMax" min="20" max="300" step="5"></label>
+      <label class="field"><span>Breath sensitivity: dB above the noise floor that counts as a breath/snore</span>
+        <input type="number" id="setBreathMargin" min="2" max="30" step="1"></label>
+      <label class="field"><span>Breaths needed in the 60 s before a pause</span>
+        <input type="number" id="setMinBreaths" min="1" max="20" step="1"></label>
+      <label class="field check"><input type="checkbox" id="setClipPauses">
+        <span>Always save a clip when breathing restarts after a pause, even if it is quiet</span></label>
+
+      <div class="actions"><button id="btnResetSettings">Reset to defaults</button></div>
+      <p class="muted">Levels are relative (0 dB = digital silence, ~100 dB = maximum). They are not calibrated
+        sound-pressure levels and differ between phones.</p>
+    </section>
+  </main>
+
+  <div id="nightOverlay" hidden>
+    <div class="night-text">
+      <div id="nightClock">--:--</div>
+      <div id="nightInfo"></div>
+      <div class="night-tip">Tap twice to exit</div>
+    </div>
+  </div>
+
+  <template id="sessionTpl">
+    <details class="session">
+      <summary>
+        <span class="s-date"></span>
+        <span class="s-meta muted"></span>
+      </summary>
+      <div class="s-body">
+        <canvas class="s-chart" height="160"></canvas>
+        <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
+          <span class="lg evt"></span>breathing pause <span class="lg clp"></span>saved clip</div>
+        <div class="s-summary"></div>
+        <h3>Breathing pauses</h3>
+        <div class="s-events"></div>
+        <h3>Saved clips</h3>
+        <div class="s-clips"></div>
+        <div class="actions">
+          <button class="btn-csv">Export CSV</button>
+          <button class="btn-dlall">Download all clips</button>
+          <button class="btn-del danger">Delete night</button>
+        </div>
+      </div>
+    </details>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
