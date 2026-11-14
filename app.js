@@ -20,10 +20,21 @@ const DEFAULTS = {
   breathMargin: 6,   // dB above noise floor that counts as a breath
   minBreaths: 3,     // breath sounds required in 60 s before a pause
   clipPauses: true,  // save a clip when breathing restarts after a pause
+  recordAll: false,  // also record the whole night (compressed)
 };
 const CLIP_RATE = 16000;     // saved audio sample rate (Hz)
 const LIVE_SECONDS = 60;     // live chart window
+const SEGMENT_MS = 10 * 60 * 1000; // whole-night recording is saved in 10-minute files
+const FULL_BITRATE = 32000;  // bits/s for whole-night recording (~14 MB per hour)
 
+// best compressed format this browser can record (webm/opus on Chrome/Android, mp4/aac on Safari)
+const FULL_MIME = (() => {
+  if (!window.MediaRecorder) return null;
+  const opts = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'];
+  return opts.find((m) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || '';
+})();
+const fmtMB = (bytes) => { const mb = bytes / 1e6; return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`; };
+const extFor = (mime) => (/mp4|aac/.test(mime) ? 'm4a' : /ogg/.test(mime) ? 'ogg' : 'webm');
 let settings = loadSettings();
 function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sleepmon.settings') || '{}') }; }
@@ -39,12 +50,18 @@ const DB = (() => {
   function open() {
     if (dbp) return dbp;
     dbp = new Promise((resolve, reject) => {
-      const req = indexedDB.open('sleepmon', 1);
-      req.onupgradeneeded = () => {
+      const req = indexedDB.open('sleepmon', 2);
+      req.onupgradeneeded = (e) => {
         const db = req.result;
-        db.createObjectStore('sessions', { keyPath: 'id' });
-        const clips = db.createObjectStore('clips', { keyPath: 'id' });
-        clips.createIndex('sessionId', 'sessionId');
+        if (e.oldVersion < 1) {
+          db.createObjectStore('sessions', { keyPath: 'id' });
+          const clips = db.createObjectStore('clips', { keyPath: 'id' });
+          clips.createIndex('sessionId', 'sessionId');
+        }
+        if (e.oldVersion < 2) {
+          const segs = db.createObjectStore('segments', { keyPath: 'id' });
+          segs.createIndex('sessionId', 'sessionId');
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -69,8 +86,15 @@ const DB = (() => {
     getSessions: () => tx('sessions', 'readonly', (st) => reqP(st.getAll())),
     getClips: (sessionId) => tx('clips', 'readonly', (st) => reqP(st.index('sessionId').getAll(sessionId))),
     deleteClip: (id) => tx('clips', 'readwrite', (st) => { st.delete(id); }),
+    putSegment: (g) => tx('segments', 'readwrite', (st) => { st.put(g); }),
+    getSegments: (sessionId) => tx('segments', 'readonly', (st) => reqP(st.index('sessionId').getAll(sessionId))),
+    async deleteSegments(sessionId) {
+      const keys = await tx('segments', 'readonly', (st) => reqP(st.index('sessionId').getAllKeys(sessionId)));
+      await tx('segments', 'readwrite', (st) => keys.forEach((k) => st.delete(k)));
+    },
     async deleteSession(id) {
       const clips = await this.getClips(id);
+      await this.deleteSegments(id);
       await tx('clips', 'readwrite', (st) => clips.forEach((c) => st.delete(c.id)));
       await tx('sessions', 'readwrite', (st) => { st.delete(id); });
     },
@@ -133,8 +157,9 @@ const Monitor = {
   saveTimer: null,
   calibrating: null,
   onFrame: null,
+  seg: null, segTimer: null,  // whole-night recording
 
-  async start() {
+  async start({ record = settings.recordAll } = {}) {
     if (this.running) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
@@ -157,6 +182,7 @@ const Monitor = {
       levels: [],      // one value per second: max dB in that second
       events: [],      // breathing pauses
       clips: [],       // { id, start, duration, peak, tag } (audio is in the clips store)
+      segments: [],    // whole-night recording: { id, start, duration, mime, size } (audio in segments store)
     };
     Object.assign(this, {
       floor: null, preBuf: [], preLen: 0, clip: null, lastActive: now, wasActive: false, inactiveSince: now,
@@ -165,12 +191,72 @@ const Monitor = {
     this.running = true;
     await DB.putSession(this.session);
     this.saveTimer = setInterval(() => this.persist(), 30000);
+    if (record) this.setRecordAll(true);
+  },
+
+  // ---- whole-night recording, saved as consecutive files of SEGMENT_MS
+  setRecordAll(on) {
+    if (!this.running || FULL_MIME === null) return Promise.resolve();
+    if (on && !this.seg) {
+      this.startSegment();
+      this.segTimer = setInterval(() => this.rotateSegment(), SEGMENT_MS);
+    } else if (!on && this.seg) {
+      clearInterval(this.segTimer);
+      const g = this.seg; this.seg = null;
+      return this.endSegment(g);
+    }
+    return Promise.resolve();
+  },
+
+  startSegment() {
+    let rec;
+    try {
+      rec = new MediaRecorder(this.stream, FULL_MIME ? { mimeType: FULL_MIME, audioBitsPerSecond: FULL_BITRATE } : { audioBitsPerSecond: FULL_BITRATE });
+    } catch (e) { console.error('MediaRecorder failed', e); this.seg = null; return; }
+    const g = { rec, chunks: [], size: 0, start: Date.now(), end: 0, mime: rec.mimeType || FULL_MIME || 'audio/webm', session: this.session };
+    g.done = new Promise((res) => { rec.onstop = () => this.saveSegment(g).then(res, res); });
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) { g.chunks.push(e.data); g.size += e.data.size; } };
+    rec.onstart = () => { g.start = Date.now(); };
+    rec.start(10000);
+    this.seg = g;
+  },
+
+  rotateSegment() {
+    const old = this.seg;
+    this.startSegment(); // start the next file before stopping the old one so nothing is missed
+    if (old) this.endSegment(old);
+  },
+
+  endSegment(g) {
+    g.end = Date.now();
+    try { g.rec.stop(); } catch { return this.saveSegment(g); }
+    return g.done;
+  },
+
+  async saveSegment(g) {
+    if (g.saved || !g.chunks.length) return;
+    g.saved = true;
+    const blob = new Blob(g.chunks, { type: g.mime });
+    const end = g.end || Date.now();
+    const meta = { id: 'g' + g.start, start: g.start, duration: +((end - g.start) / 1000).toFixed(1), mime: g.mime, size: blob.size };
+    g.session.segments.push(meta);
+    try {
+      await DB.putSegment({ ...meta, sessionId: g.session.id, blob });
+      await DB.putSession(g.session);
+    } catch (e) { console.error('segment save failed', e); }
+  },
+
+  fullBytes() {
+    if (!this.session) return 0;
+    return this.session.segments.reduce((n, g) => n + g.size, 0) + (this.seg ? this.seg.size : 0);
   },
 
   async stop() {
     if (!this.running) return;
     this.running = false;
     clearInterval(this.saveTimer);
+    clearInterval(this.segTimer);
+    if (this.seg) { const g = this.seg; this.seg = null; await this.endSegment(g); }
     if (this.clip) await this.finishClip();
     try { this.proc.disconnect(); this.src.disconnect(); this.sink.disconnect(); } catch {}
     this.stream.getTracks().forEach((t) => t.stop());
@@ -393,8 +479,9 @@ Monitor.onFrame = () => {
     $('stClips').textContent = s.clips.length + (Monitor.clip ? ' +1' : '');
     $('stEvents').textContent = s.events.length;
     $('stRate').textContent = rate(s.events.length, el);
-    $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses`;
+    $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses` + (Monitor.seg ? ' · recording all' : '');
   }
+  updateRecordAllInfo();
   $('stFloor').textContent = Monitor.floor === null ? '–' : `${Monitor.floor.toFixed(0)} dB`;
   if (!$('monitor').classList.contains('active') || !$('nightOverlay').hidden) return;
   drawLive();
@@ -424,7 +511,7 @@ $('btnStop').onclick = async () => {
 $('btnCalibrate').onclick = async () => {
   const startedHere = !Monitor.running;
   if (startedHere) {
-    try { await Monitor.start(); } catch (e) { alert('Microphone error: ' + e.message); return; }
+    try { await Monitor.start({ record: false }); } catch (e) { alert('Microphone error: ' + e.message); return; }
   }
   $('btnCalibrate').disabled = true; $('btnCalibrate').textContent = 'Stay quiet… measuring 10 s';
   const t = await Monitor.calibrate(10);
@@ -439,6 +526,20 @@ $('btnCalibrate').onclick = async () => {
     settings.threshold = Math.min(100, Math.max(20, t)); saveSettings(); updateThresholdUI();
     alert(`Threshold set to ${settings.threshold} dB (room level + 15 dB). Adjust with the slider if needed.`);
   }
+};
+
+function updateRecordAllInfo() {
+  const el = $('recordAllInfo');
+  if (FULL_MIME === null) { el.textContent = 'Whole-night recording is not supported by this browser.'; return; }
+  if (!Monitor.running) { el.textContent = settings.recordAll ? 'Will record the whole night when you start.' : ''; return; }
+  const bytes = Monitor.fullBytes();
+  el.textContent = Monitor.seg ? `● Recording the whole night${bytes ? ` · ${fmtMB(bytes)} so far` : ''}`
+    : (bytes ? `Whole-night recording paused · ${fmtMB(bytes)} saved` : '');
+}
+$('recordAll').onchange = (e) => {
+  settings.recordAll = e.target.checked; saveSettings();
+  Monitor.setRecordAll(settings.recordAll);
+  updateRecordAllInfo();
 };
 
 $('thresholdQuick').oninput = (e) => { settings.threshold = +e.target.value; saveSettings(); updateThresholdUI(); };
@@ -478,6 +579,9 @@ const FIELDS = {
 function fillSettings() {
   for (const [id, key] of Object.entries(FIELDS)) $(id).value = settings[key];
   $('setClipPauses').checked = settings.clipPauses;
+  $('recordAll').checked = settings.recordAll;
+  $('recordAll').disabled = FULL_MIME === null;
+  updateRecordAllInfo();
   updateThresholdUI();
 }
 for (const [id, key] of Object.entries(FIELDS)) {
@@ -489,7 +593,7 @@ for (const [id, key] of Object.entries(FIELDS)) {
   });
 }
 $('setClipPauses').onchange = (e) => { settings.clipPauses = e.target.checked; saveSettings(); };
-$('btnResetSettings').onclick = () => { settings = { ...DEFAULTS }; saveSettings(); fillSettings(); };
+$('btnResetSettings').onclick = () => { settings = { ...DEFAULTS }; saveSettings(); Monitor.setRecordAll(settings.recordAll); fillSettings(); };
 
 // ---------------------------------------------------------------- history UI
 const openViews = new Set();
@@ -509,48 +613,63 @@ async function renderHistory() {
 }
 
 const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(Math.floor(sec % 60))}`;
+const segBytes = (s) => (s.segments || []).reduce((n, g) => n + (g.size || 0), 0);
 
 function renderSession(s) {
   const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
-  const dur = s.end - s.start;
   const live = Monitor.session && Monitor.session.id === s.id;
   if (live) s = Monitor.session; // show the latest data of a night still being recorded
+  if (!s.segments) s.segments = [];
+  const meta = () => {
+    const dur = (live ? Date.now() : s.end) - s.start;
+    const full = s.segments.length ? ` · full recording ${fmtMB(segBytes(s))}` : '';
+    return `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h${full}`;
+  };
   el.querySelector('.s-date').textContent = fmtDate(s.start) + (live ? '  (recording now)' : '');
-  el.querySelector('.s-meta').textContent =
-    `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h`;
+  el.querySelector('.s-meta').textContent = meta();
 
   let view = null;
   el.addEventListener('toggle', async () => {
     if (!el.open) { if (view) view.pause(); return; }
     if (view) { view.draw(); return; }
-    const clips = (await DB.getClips(s.id)).sort((a, b) => a.start - b.start);
-    view = new NightView(el, s, clips, live);
+    const [clips, segs] = await Promise.all([DB.getClips(s.id), DB.getSegments(s.id)]);
+    view = new NightView(el, s, clips.sort((a, b) => a.start - b.start), segs.sort((a, b) => a.start - b.start), live);
     openViews.add(view);
 
-    const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
-    const loud = s.events.filter((e) => e.loudResume).length;
-    el.querySelector('.s-summary').innerHTML =
-      `<b>${s.events.length}</b> breathing pauses ≥ ${s.settings.apneaGap}s ` +
-      `(<b>${rate(s.events.length, dur)}</b>/hour)` +
-      (s.events.length ? ` · longest <b>${longest}s</b> · ${loud} ended with a loud gasp/snore` : '') +
-      `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
-      `This app's count is only a rough sound-based estimate.</span>`;
+    const renderSummary = () => {
+      const dur = (live ? Date.now() : s.end) - s.start;
+      const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
+      const loud = s.events.filter((e) => e.loudResume).length;
+      el.querySelector('.s-summary').innerHTML =
+        `<b>${s.events.length}</b> breathing pauses ≥ ${s.settings.apneaGap}s ` +
+        `(<b>${rate(s.events.length, dur)}</b>/hour)` +
+        (s.events.length ? ` · longest <b>${longest}s</b> · ${loud} ended with a loud gasp/snore` : '') +
+        (view.segs.length ? '<br>Whole night recorded: tap anywhere on the graph to listen.' : '') +
+        `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
+        `This app's count is only a rough sound-based estimate.</span>`;
+      el.querySelector('.s-meta').textContent = meta();
+      el.querySelector('.btn-dlfull').hidden = !view.segs.length;
+      el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
+    };
 
     // breathing pauses: tap to zoom the graph there and play the sound
     const evBox = el.querySelector('.s-events');
-    evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
-    s.events.forEach((e) => {
-      const d = document.createElement('div');
-      d.className = 'list-item clickable';
-      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
-        (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
-      d.onclick = () => view.focusEvent(e);
-      evBox.appendChild(d);
-    });
+    const renderEvents = () => {
+      evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
+      s.events.forEach((e) => {
+        const d = document.createElement('div');
+        d.className = 'list-item clickable';
+        d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
+          (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
+        d.onclick = () => view.focusEvent(e);
+        evBox.appendChild(d);
+      });
+    };
 
-    // clips: tap a row to play it on the graph
+    // clips: tap a row to play it
     const clipBox = el.querySelector('.s-clips');
     const renderClips = () => {
+      const clips = view.clips;
       clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
       clips.forEach((c, i) => {
         const d = document.createElement('div');
@@ -566,27 +685,40 @@ function renderSession(s) {
           s.clips = s.clips.filter((x) => x.id !== c.id);
           if (!live) await DB.putSession(s);
           view.removeClip(c);
-          renderClips();
+          renderClips(); renderSummary();
         };
         clipBox.appendChild(d);
       });
+      view.rowMark = null;
       view.markRows();
     };
-    view.onClipsChanged = renderClips;
-    renderClips();
+    view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
+    view.onDataChanged();
 
     el.querySelector('.btn-csv').onclick = () => {
       const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
       s.events.forEach((e) => rows.push(['pause', new Date(e.start).toISOString(), new Date(e.end).toISOString(), e.duration, '', e.loudResume ? 'loud resume' : '']));
-      clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
+      view.clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
       download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
     };
     el.querySelector('.btn-dlall').onclick = async () => {
-      for (const c of clips) { download(c.blob, `sleep_${fileStamp(c.start)}.wav`); await new Promise((r) => setTimeout(r, 300)); }
+      for (const c of view.clips) { download(c.blob, `sleep_${fileStamp(c.start)}.wav`); await new Promise((r) => setTimeout(r, 300)); }
+    };
+    el.querySelector('.btn-dlfull').onclick = async () => {
+      if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Download them all?`)) return;
+      for (const g of view.segs) { download(g.blob, `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}`); await new Promise((r) => setTimeout(r, 400)); }
+    };
+    el.querySelector('.btn-delfull').onclick = async () => {
+      if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(s))})? Saved clips and the graph are kept.`)) return;
+      await DB.deleteSegments(s.id);
+      s.segments = [];
+      await DB.putSession(s);
+      view.clearSegments();
+      renderSummary();
     };
     el.querySelector('.btn-del').onclick = async () => {
       if (live) { alert('Stop monitoring first.'); return; }
-      if (!confirm('Delete this whole night, including all clips?')) return;
+      if (!confirm('Delete this whole night, including all clips and the full recording?')) return;
       await DB.deleteSession(s.id);
       renderHistory();
     };
@@ -596,19 +728,23 @@ function renderSession(s) {
 
 /*
  * Interactive graph of one night + audio player.
- * - Tap: play the clip under the finger, starting at that moment.
- * - Drag: scroll. Pinch / wheel / +− buttons: zoom.
- * - A playhead moves across the graph while audio plays.
+ * Two kinds of audio can be played:
+ *   'seg'  — whole-night recording (10-minute files, played back to back)
+ *   'clip' — short WAV clips saved when sound passed the threshold
+ * Tap the graph: plays the whole-night recording at that moment if there is one, otherwise the clip there.
+ * Drag: scroll. Pinch / wheel / +− buttons: zoom. A playhead follows playback.
  */
 class NightView {
-  constructor(root, s, clips, live) {
-    this.root = root; this.s = s; this.clips = clips; this.live = live;
+  constructor(root, s, clips, segs, live) {
+    this.root = root; this.s = s; this.clips = clips; this.segs = segs; this.live = live;
     this.cv = root.querySelector('.s-chart');
     this.tip = root.querySelector('.s-tip');
     this.audio = new Audio();
     this.audio.preload = 'auto';
     this.urls = new Map();
-    this.cur = -1; this.selEvent = null; this.raf = 0;
+    this.mode = null; this.cur = -1; this.tok = 0; this.loadedId = null;
+    this.fixing = false; this.pendingOffset = 0;
+    this.selEvent = null; this.raf = 0; this.rowMark = null;
     this.t0 = s.start;
     this.v0 = this.t0; this.v1 = this.tEnd();
 
@@ -620,32 +756,35 @@ class NightView {
     q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
     q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.draw(); };
     this.ui.play.onclick = () => this.toggle();
-    this.ui.prev.onclick = () => this.play(Math.max(0, (this.cur < 0 ? 0 : this.cur - 1)));
-    this.ui.next.onclick = () => this.play(Math.min(this.clips.length - 1, this.cur + 1));
+    this.ui.prev.onclick = () => this.jump(-1);
+    this.ui.next.onclick = () => this.jump(1);
     this.ui.seek.oninput = () => {
-      if (this.audio.duration) this.audio.currentTime = (this.ui.seek.value / 1000) * this.audio.duration;
+      const it = this.item();
+      if (it && !this.fixing) this.audio.currentTime = (this.ui.seek.value / 1000) * it.duration;
       this.draw();
     };
     this.audio.addEventListener('play', () => { this.ui.play.textContent = '⏸'; this.loop(); });
-    this.audio.addEventListener('pause', () => { this.ui.play.textContent = '▶'; this.draw(); });
-    this.audio.addEventListener('ended', () => {
-      if (this.ui.all.checked && this.cur < this.clips.length - 1) this.play(this.cur + 1);
-    });
+    this.audio.addEventListener('pause', () => { if (!this.fixing) this.ui.play.textContent = '▶'; this.draw(); });
+    this.audio.addEventListener('ended', () => this.onEnded());
     this.audio.addEventListener('timeupdate', () => this.updatePlayer());
 
     this.bindPointer();
     this.onResize = () => { if (root.open) this.draw(); };
     window.addEventListener('resize', this.onResize);
     if (live) {
-      // night still being recorded: keep the graph growing if you're looking at the latest part
+      // night still being recorded: pick up new clips/files and keep the graph growing
       this.lastEnd = this.v1;
       this.liveTimer = setInterval(() => {
         if (!root.open) return;
         const end = this.tEnd(), sp = this.v1 - this.v0, atEnd = this.v1 >= this.lastEnd - 1000;
         this.lastEnd = end;
         if (atEnd) { this.v1 = end; if (this.v0 !== this.t0) this.v0 = end - sp; }
+        if (this.s.clips.length !== this.clips.length || this.s.segments.length !== this.segs.length) this.reload();
+        else if (this.onDataChanged && this.s.events.length !== this.evCount) this.onDataChanged();
+        this.evCount = this.s.events.length;
         if (this.audio.paused) this.draw();
       }, 5000);
+      this.evCount = s.events.length;
     }
     this.updatePlayer();
     this.draw();
@@ -658,12 +797,28 @@ class NightView {
     this.urls.forEach((u) => URL.revokeObjectURL(u));
   }
 
+  async reload() {
+    const it = this.item();
+    const [clips, segs] = await Promise.all([DB.getClips(this.s.id), DB.getSegments(this.s.id)]);
+    this.clips = clips.sort((a, b) => a.start - b.start);
+    this.segs = segs.sort((a, b) => a.start - b.start);
+    if (it) this.cur = this.list().findIndex((x) => x.id === it.id);
+    if (this.cur < 0) this.mode = null;
+    if (this.onDataChanged) this.onDataChanged();
+    this.updatePlayer(); this.draw();
+  }
+
   tEnd() { return Math.max(this.live ? Date.now() : this.s.end, this.t0 + 60000); }
   center() { return (this.v0 + this.v1) / 2; }
   width() { return this.cv.clientWidth || 300; }
   tAt(x) { return this.v0 + (x / this.width()) * (this.v1 - this.v0); }
   xOf(t) { return ((t - this.v0) / (this.v1 - this.v0)) * this.width(); }
-  clipEnd(c) { return c.start + c.duration * 1000; }
+  endOf(c) { return c.start + c.duration * 1000; }
+  list(mode = this.mode) { return mode === 'seg' ? this.segs : this.clips; }
+  item() { return this.mode ? this.list()[this.cur] || null : null; }
+  pos() { return this.fixing ? this.pendingOffset : this.audio.currentTime || 0; }
+  curT() { const it = this.item(); return it ? it.start + this.pos() * 1000 : null; }
+  segAt(t) { return this.segs.findIndex((g) => t >= g.start && t < this.endOf(g)); }
 
   setView(v0, v1) {
     const t1 = this.tEnd(), span = Math.min(v1 - v0, t1 - this.t0);
@@ -679,84 +834,173 @@ class NightView {
     this.setView(t - r * span, t - r * span + span);
   }
 
-  ensureVisible(t, span) {
-    if (t >= this.v0 && t <= this.v1 && (!span || this.v1 - this.v0 <= span * 1.5)) return;
-    const sp = span ? Math.max(span, 30000) : this.v1 - this.v0;
+  ensureVisible(t) {
+    if (t >= this.v0 && t <= this.v1) return;
+    const sp = this.v1 - this.v0;
     this.setView(t - sp / 2, t + sp / 2);
   }
 
   // ---- playback
-  url(c) {
-    if (!this.urls.has(c.id)) this.urls.set(c.id, URL.createObjectURL(c.blob));
-    return this.urls.get(c.id);
+  url(it) {
+    if (!this.urls.has(it.id)) this.urls.set(it.id, URL.createObjectURL(it.blob));
+    return this.urls.get(it.id);
   }
 
-  play(i, offsetSec = 0) {
-    const c = this.clips[i];
-    if (!c) return;
+  play(i, offsetSec = 0) { this.playItem('clip', i, offsetSec); }
+
+  // play the whole-night recording at time t if it covers t, otherwise clip `clipIdx` (if given)
+  playAt(t, clipIdx = -1) {
+    const gi = this.segAt(t);
+    if (gi >= 0) return this.playItem('seg', gi, (t - this.segs[gi].start) / 1000);
+    if (clipIdx >= 0) {
+      const c = this.clips[clipIdx];
+      this.playItem('clip', clipIdx, t >= c.start && t <= this.endOf(c) ? (t - c.start) / 1000 : 0);
+    }
+  }
+
+  playItem(mode, i, offset = 0) {
+    const it = this.list(mode)[i];
+    if (!it) return;
     openViews.forEach((v) => v !== this && v.pause());
-    const changed = this.cur !== i;
-    this.cur = i;
-    const seek = () => { try { this.audio.currentTime = Math.min(offsetSec, Math.max(0, c.duration - 0.1)); } catch {} };
-    if (changed) {
-      this.audio.src = this.url(c);
-      this.audio.addEventListener('loadedmetadata', seek, { once: true });
-    } else seek();
-    this.audio.play().catch(() => {});
-    this.ensureVisible(c.start + offsetSec * 1000);
+    const a = this.audio, tok = ++this.tok;
+    offset = Math.max(0, Math.min(offset, it.duration - 0.2));
+    this.mode = mode; this.cur = i; this.pendingOffset = offset;
+    const seekTo = () => {
+      if (tok !== this.tok) return;
+      if (Number.isFinite(a.duration)) { a.currentTime = offset; return; }
+      // Files from MediaRecorder (webm) have no duration in their header, so the browser can't seek.
+      // Jumping to the end once makes it scan the file; then seeking works.
+      this.fixing = true; a.muted = true;
+      const done = () => {
+        if (!Number.isFinite(a.duration) || tok !== this.tok) return;
+        a.removeEventListener('durationchange', done);
+        a.currentTime = offset; a.muted = false; this.fixing = false;
+        if (a.paused) a.play().catch(() => {});
+      };
+      a.addEventListener('durationchange', done);
+      a.currentTime = 1e101;
+    };
+    if (this.loadedId !== it.id) {
+      this.loadedId = it.id; this.fixing = false; a.muted = false;
+      a.src = this.url(it);
+      a.addEventListener('loadedmetadata', seekTo, { once: true });
+    } else seekTo();
+    a.play().catch(() => {}); // called right away so it counts as a user gesture on iPhone
+    this.ensureVisible(it.start + offset * 1000);
     this.markRows();
     this.updatePlayer();
   }
 
+  onEnded() {
+    if (this.fixing) return;
+    const it = this.item();
+    if (!it) return;
+    if (this.mode === 'seg') {
+      const next = this.segs[this.cur + 1];
+      // continue straight into the next 10-minute file (they overlap by a fraction of a second)
+      if (next && next.start - this.endOf(it) < 5000) this.playItem('seg', this.cur + 1, Math.max(0, (this.endOf(it) - next.start) / 1000));
+    } else if (this.ui.all.checked && this.cur < this.clips.length - 1) {
+      this.playAt(this.clips[this.cur + 1].start, this.cur + 1);
+    }
+  }
+
   toggle() {
-    if (this.cur < 0) { if (this.clips.length) this.play(0); return; }
+    if (!this.item()) {
+      if (this.segs.length) this.playAt(this.segAt(this.v0) >= 0 ? this.v0 : this.segs[0].start);
+      else if (this.clips.length) this.play(0);
+      return;
+    }
     if (this.audio.paused) this.audio.play().catch(() => {}); else this.audio.pause();
   }
 
   pause() { if (!this.audio.paused) this.audio.pause(); }
 
+  // previous / next loud sound (clip). With a whole-night recording, play it in context from there.
+  targetClip(dir) {
+    const t = this.curT();
+    if (t === null) return dir > 0 ? (this.clips.length ? 0 : -1) : -1;
+    if (dir > 0) return this.clips.findIndex((c) => c.start > t + 1000);
+    for (let i = this.clips.length - 1; i >= 0; i--) if (this.clips[i].start < t - 3000) return i;
+    return -1;
+  }
+
+  jump(dir) {
+    const i = this.targetClip(dir);
+    if (i >= 0) this.playAt(this.clips[i].start, i);
+  }
+
   removeClip(c) {
     const i = this.clips.indexOf(c);
     if (i < 0) return;
-    if (i === this.cur) { this.pause(); this.audio.removeAttribute('src'); this.cur = -1; }
-    else if (i < this.cur) this.cur--;
+    if (this.mode === 'clip') {
+      if (i === this.cur) { this.stopAudio(); }
+      else if (i < this.cur) this.cur--;
+    }
     this.clips.splice(i, 1);
-    if (this.urls.has(c.id)) { URL.revokeObjectURL(this.urls.get(c.id)); this.urls.delete(c.id); }
+    this.revoke(c.id);
     this.updatePlayer(); this.draw();
   }
 
+  clearSegments() {
+    if (this.mode === 'seg') this.stopAudio();
+    this.segs.forEach((g) => this.revoke(g.id));
+    this.segs = [];
+    this.updatePlayer(); this.draw();
+  }
+
+  stopAudio() {
+    this.pause(); this.tok++;
+    this.audio.removeAttribute('src'); this.audio.load();
+    this.mode = null; this.cur = -1; this.loadedId = null; this.fixing = false;
+    this.markRows();
+  }
+
+  revoke(id) { if (this.urls.has(id)) { URL.revokeObjectURL(this.urls.get(id)); this.urls.delete(id); } }
+
   markRows() {
-    this.root.querySelectorAll('.clip-row').forEach((r, i) => r.classList.toggle('playing', i === this.cur));
+    let idx = -1;
+    if (this.mode === 'clip') idx = this.cur;
+    else if (this.mode === 'seg') { const t = this.curT(); idx = this.clips.findIndex((c) => t >= c.start && t <= this.endOf(c)); }
+    if (idx === this.rowMark) return;
+    this.rowMark = idx;
+    this.root.querySelectorAll('.clip-row').forEach((r, i) => r.classList.toggle('playing', i === idx));
   }
 
   updatePlayer() {
-    const c = this.clips[this.cur], u = this.ui;
-    u.prev.disabled = this.cur <= 0;
-    u.next.disabled = !this.clips.length || this.cur >= this.clips.length - 1;
-    u.play.disabled = !this.clips.length;
-    if (!c) {
-      u.title.textContent = this.clips.length ? 'Tap the graph or a clip to play' : 'No saved clips this night';
+    const it = this.item(), u = this.ui;
+    const hasAudio = this.clips.length || this.segs.length;
+    u.prev.disabled = this.targetClip(-1) < 0;
+    u.next.disabled = this.targetClip(1) < 0;
+    u.play.disabled = !hasAudio;
+    if (!it) {
+      u.title.textContent = this.segs.length ? 'Tap the graph to listen to any moment'
+        : this.clips.length ? 'Tap the graph or a clip to play' : 'No audio saved this night';
       u.seek.value = 0; u.time.textContent = '0:00';
       return;
     }
-    const at = this.audio.currentTime || 0;
-    u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(c.start + at * 1000)} · peak ${c.peak} dB` +
-      (c.tag === 'after pause' ? ' · after pause' : '');
-    u.seek.value = c.duration ? Math.round((at / c.duration) * 1000) : 0;
-    u.time.textContent = `${fmtClock(at)} / ${fmtClock(c.duration)}`;
+    const at = this.pos(), t = this.curT();
+    if (this.mode === 'seg') {
+      const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
+      const loud = this.clips.some((c) => t >= c.start && t <= this.endOf(c));
+      u.title.textContent = `Whole night · ${fmtTime(t)}` + (ev ? ' · breathing pause' : loud ? ' · loud sound' : '');
+    } else {
+      u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(t)} · peak ${it.peak} dB` +
+        (it.tag === 'after pause' ? ' · after pause' : '');
+    }
+    u.seek.value = it.duration ? Math.round((at / it.duration) * 1000) : 0;
+    u.time.textContent = `${fmtClock(at)} / ${fmtClock(it.duration)}`;
   }
 
   loop() {
     cancelAnimationFrame(this.raf);
     const step = () => {
-      if (this.audio.paused) return;
-      const c = this.clips[this.cur];
-      if (c) {
-        const t = c.start + this.audio.currentTime * 1000;
+      if (this.audio.paused && !this.fixing) return;
+      const t = this.curT();
+      if (t !== null && (t > this.v1 || t < this.v0)) {
         // follow the playhead when it runs off the visible part of the graph
-        if (t > this.v1 || t < this.v0) { const sp = this.v1 - this.v0; this.setView(t - sp * 0.1, t + sp * 0.9); }
+        const sp = this.v1 - this.v0; this.setView(t - sp * 0.1, t + sp * 0.9);
       }
-      this.draw(); this.updatePlayer();
+      this.draw(); this.updatePlayer(); this.markRows();
       this.raf = requestAnimationFrame(step);
     };
     this.raf = requestAnimationFrame(step);
@@ -766,16 +1010,17 @@ class NightView {
     this.selEvent = e;
     const span = Math.max(120000, e.duration * 1000 * 5);
     this.setView((e.start + e.end) / 2 - span / 2, (e.start + e.end) / 2 + span / 2);
-    // play the sound when breathing restarted (or the closest clip around the pause)
-    let best = -1, bestD = Infinity;
-    this.clips.forEach((c, i) => {
-      if (c.start > e.end + 30000 || this.clipEnd(c) < e.start - 30000) return;
-      const d = Math.abs(c.start - e.end) - (c.tag === 'after pause' ? 5000 : 0);
-      if (d < bestD) { bestD = d; best = i; }
-    });
-    if (best >= 0) {
-      const c = this.clips[best];
-      this.play(best, Math.max(0, (e.end - 5000 - c.start) / 1000)); // start 5 s before breathing restarted
+    if (this.segAt(e.start) >= 0) {
+      this.playAt(Math.max(e.start - 5000, this.t0)); // whole night: hear the last breaths, the silence and the restart
+    } else {
+      // play the sound when breathing restarted (or the closest clip around the pause)
+      let best = -1, bestD = Infinity;
+      this.clips.forEach((c, i) => {
+        if (c.start > e.end + 30000 || this.endOf(c) < e.start - 30000) return;
+        const d = Math.abs(c.start - e.end) - (c.tag === 'after pause' ? 5000 : 0);
+        if (d < bestD) { bestD = d; best = i; }
+      });
+      if (best >= 0) this.play(best, Math.max(0, (e.end - 5000 - this.clips[best].start) / 1000));
     }
     this.cv.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
@@ -834,7 +1079,7 @@ class NightView {
     const t = this.tAt(x), pxPerMs = this.width() / (this.v1 - this.v0);
     let best = -1, bestD = 16; // px tolerance for tapping thin clips
     this.clips.forEach((c, i) => {
-      const d = t < c.start ? (c.start - t) * pxPerMs : t > this.clipEnd(c) ? (t - this.clipEnd(c)) * pxPerMs : 0;
+      const d = t < c.start ? (c.start - t) * pxPerMs : t > this.endOf(c) ? (t - this.endOf(c)) * pxPerMs : 0;
       if (d < bestD) { bestD = d; best = i; }
     });
     return best;
@@ -842,14 +1087,14 @@ class NightView {
 
   levelAt(t) { const v = this.s.levels[Math.floor((t - this.s.start) / 1000)]; return v === undefined ? null : v; }
 
-  showTip(x, extra = '') {
+  showTip(x) {
     const t = this.tAt(x), lvl = this.levelAt(t);
     const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
     const ci = this.clipAt(x);
     let html = `${fmtTime(t)}${lvl !== null ? ` · ${Math.round(lvl)} dB` : ''}`;
     if (ev) html += `<br>Breathing pause ${ev.duration}s`;
-    html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
-    if (extra) html += `<br>${extra}`;
+    if (this.segAt(t) >= 0) html += '<br><b>Tap to listen</b>';
+    else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
     this.tip.innerHTML = html;
     this.tip.style.left = `${Math.max(70, Math.min(this.width() - 70, x))}px`;
     this.tip.hidden = false;
@@ -859,10 +1104,8 @@ class NightView {
     const t = this.tAt(x);
     this.selEvent = this.s.events.find((e) => t >= e.start && t <= e.end) || null;
     const ci = this.clipAt(x);
-    if (ci >= 0) {
-      const c = this.clips[ci];
-      const off = t >= c.start && t <= this.clipEnd(c) ? (t - c.start) / 1000 : 0;
-      this.play(ci, off);
+    if (this.segAt(t) >= 0 || ci >= 0) {
+      this.playAt(t, ci);
       this.tip.hidden = true;
     } else {
       this.showTip(x);
@@ -910,13 +1153,21 @@ class NightView {
     g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
     g.moveTo(0, y(s.settings.threshold)); g.lineTo(w, y(s.settings.threshold)); g.stroke(); g.setLineDash([]);
 
+    // whole-night recording coverage: green strip along the top
+    g.fillStyle = css('--ok');
+    this.segs.forEach((sg) => {
+      const x0 = this.xOf(sg.start), x1 = this.xOf(this.endOf(sg));
+      if (x1 < 0 || x0 > w) return;
+      g.fillRect(x0, 0, Math.max(1, x1 - x0), 4);
+    });
+
     // clips
     const clipCol = css('--clip');
     this.clips.forEach((c, i) => {
-      const x0 = this.xOf(c.start), x1 = this.xOf(this.clipEnd(c));
+      const x0 = this.xOf(c.start), x1 = this.xOf(this.endOf(c));
       if (x1 < 0 || x0 > w) return;
       const cw = Math.max(3, x1 - x0);
-      if (i === this.cur) {
+      if (this.mode === 'clip' && i === this.cur) {
         g.fillStyle = 'rgba(242,201,76,.18)'; g.fillRect(x0, 0, cw, ch);
         g.fillStyle = clipCol; g.fillRect(x0, ch - 10, cw, 10);
       } else {
@@ -925,9 +1176,9 @@ class NightView {
     });
 
     // playhead
-    const c = this.clips[this.cur];
-    if (c) {
-      const x = this.xOf(c.start + (this.audio.currentTime || 0) * 1000);
+    const t = this.curT();
+    if (t !== null) {
+      const x = this.xOf(t);
       if (x >= 0 && x <= w) { g.fillStyle = '#fff'; g.fillRect(x - 1, 0, 2, ch); }
     }
 
@@ -937,10 +1188,10 @@ class NightView {
     const showSec = stepMs < 60e3;
     g.fillStyle = css('--muted'); g.font = '10px system-ui';
     const tz = new Date(this.v0).getTimezoneOffset() * 60000;
-    for (let t = Math.ceil((this.v0 - tz) / stepMs) * stepMs + tz; t <= this.v1; t += stepMs) {
-      const x = this.xOf(t);
+    for (let tt = Math.ceil((this.v0 - tz) / stepMs) * stepMs + tz; tt <= this.v1; tt += stepMs) {
+      const x = this.xOf(tt);
       g.fillRect(x, ch, 1, 4);
-      const label = new Date(t).toLocaleTimeString([], showSec ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : { hour: '2-digit', minute: '2-digit' });
+      const label = new Date(tt).toLocaleTimeString([], showSec ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : { hour: '2-digit', minute: '2-digit' });
       const tw = g.measureText(label).width;
       g.fillText(label, Math.max(0, Math.min(w - tw, x - tw / 2)), h - 3);
     }

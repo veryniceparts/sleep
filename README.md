@@ -5,6 +5,7 @@ A web app you install on your phone. It listens to you while you sleep and:
 - **records and saves every sound louder than your threshold** (snoring, gasping, choking) as a WAV clip. Each clip includes a few seconds from before the sound started, so you hear what led up to it.
 - **detects breathing pauses**: it hears normal breathing or snoring, then silence for at least 10 s, then breathing again. Each pause is logged as a possible apnea event, along with whether breathing restarted with a loud gasp or snort.
 - shows an **interactive graph of each night** with sound level, threshold, breathing pauses and saved clips, plus **pauses per hour**.
+- can optionally **record the whole night** (compressed, about 15 MB per hour), so you can listen to any moment, not only the loud ones.
 - lets you **replay** what happened: tap anywhere on the graph to hear that moment, or play every clip one after another to replay the night.
 - lets you download and delete clips, and **export a CSV** of the night to show your doctor.
 
@@ -26,19 +27,21 @@ Then use **Add to Home Screen** (iOS Safari) or **Install app** (Android Chrome)
 
 1. Plug the phone into a charger and put it 0.5–1 m from your head, microphone facing you.
 2. In a quiet room, tap **Auto-set threshold** and stay silent for 10 s. This sets the threshold to the room level + 15 dB. Fine-tune it with the slider.
-3. Tap **Start monitoring**, then **Night mode** to turn the screen black. Double-tap to exit.
-4. **Leave the app open.** The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
-5. In the morning, tap **Stop** and open **History**.
+3. Optional: tick **Record the whole night** if you want to be able to listen to any moment later.
+4. Tap **Start monitoring**, then **Night mode** to turn the screen black. Double-tap to exit.
+5. **Leave the app open.** The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
+6. In the morning, tap **Stop** and open **History**.
 
 ## Checking a night: graph and replay
 
 Open **History** and tap a night.
 
 - **Graph:** the blue area is sound level, the red dashed line is your threshold, orange bands are breathing pauses and yellow marks along the bottom are saved clips.
-- **Tap the graph** to play the sound at that moment. A white playhead moves across the graph while it plays, and the graph scrolls to follow it.
+- **Green strip along the top:** parts of the night covered by the whole-night recording.
+- **Tap the graph** to play the sound at that moment. With a whole-night recording, any moment can be played and playback keeps going through the night. Without one, only the saved clips can be played. A white playhead moves across the graph while it plays, and the graph scrolls to follow it.
 - **Zoom and scroll:** pinch, use the mouse wheel or the **+ / −** buttons to zoom from the whole night down to 30 s. Drag sideways to scroll. **Whole night** zooms back out.
-- **Player:** play/pause, previous/next clip and a seek bar. Tick **Play all clips** to play the whole night's clips in order.
-- **Tap a breathing pause** in the list to zoom to it and play from 5 s before breathing restarted.
+- **Player:** play/pause, previous/next loud sound and a seek bar. Tick **Play all clips** to play the whole night's clips in order.
+- **Tap a breathing pause** in the list to zoom to it. With a whole-night recording it plays from 5 s before the pause, so you hear the last breaths, the silence and the restart. Without one, it plays the clip from when breathing restarted.
 - **Tap a clip** in the list to play it on the graph.
 
 You can open History while monitoring is still running. The graph keeps growing as the night is recorded.
@@ -63,7 +66,10 @@ Levels are relative: 0 dB is digital silence and about 100 dB is the loudest the
 
 ## Storage
 
-Clips are 16 kHz mono WAV, about 32 KB per second. A night with 200 short clips uses about 50–100 MB. Delete old nights in History.
+- **Clips:** 16 kHz mono WAV, about 32 KB per second. A night with 200 short clips uses about 50–100 MB.
+- **Whole-night recording:** compressed (Opus/WebM on Android and Chrome, AAC/MP4 on iPhone) at 32 kbit/s, about 15 MB per hour or roughly 120 MB for an 8-hour night. It is saved in 10-minute files, so if the browser crashes you lose at most the last 10 minutes. **Download full recording** saves these files. **Delete full recording** frees the space but keeps the graph and clips.
+
+Delete old nights in History.
 
 ## Files
 

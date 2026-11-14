@@ -49,6 +49,10 @@
         <div><span class="k">Noise floor</span><span id="stFloor" class="v">–</span></div>
       </div>
 
+      <label class="field check record-all"><input type="checkbox" id="recordAll">
+        <span><b>Record the whole night</b> (about 15 MB per hour) so you can replay any moment, not only the loud ones</span></label>
+      <div id="recordAllInfo" class="muted"></div>
+
       <div class="actions">
         <button id="btnStart" class="primary big">Start monitoring</button>
         <button id="btnStop" class="danger big" hidden>Stop</button>
@@ -129,7 +133,8 @@
           <div class="s-tip" hidden></div>
         </div>
         <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
-          <span class="lg evt"></span>breathing pause <span class="lg clp"></span>saved clip</div>
+          <span class="lg evt"></span>breathing pause <span class="lg clp"></span>saved clip
+          <span class="lg full"></span>whole-night recording</div>
         <p class="muted">Tap the graph to play the sound at that moment. Drag sideways to scroll. Pinch, use the mouse wheel or +/− to zoom.</p>
 
         <div class="player">
@@ -152,6 +157,8 @@
         <div class="actions">
           <button class="btn-csv">Export CSV</button>
           <button class="btn-dlall">Download all clips</button>
+          <button class="btn-dlfull" hidden>Download full recording</button>
+          <button class="btn-delfull danger" hidden>Delete full recording</button>
           <button class="btn-del danger">Delete night</button>
         </div>
       </div>

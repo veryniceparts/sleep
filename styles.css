@@ -111,3 +111,8 @@ canvas { display: block; width: 100%; background: var(--panel2); border-radius: 
 .list-item.playing { background: rgba(242,201,76,.12); }
 .list-item.playing > span:first-child::before { content: '▶ '; color: var(--clip); }
 .list-item .grow { flex: 1; }
+.lg.full { background: var(--ok); }
+.record-all { background: var(--panel); border-radius: 10px; padding: 10px 12px; margin-top: 14px; }
+.record-all span { color: var(--text); }
+#recordAllInfo { min-height: 1.2em; margin: 4px 2px 0; }
+#recordAllInfo:empty { display: none; }
