@@ -492,7 +492,11 @@ $('setClipPauses').onchange = (e) => { settings.clipPauses = e.target.checked; s
 $('btnResetSettings').onclick = () => { settings = { ...DEFAULTS }; saveSettings(); fillSettings(); };
 
 // ---------------------------------------------------------------- history UI
+const openViews = new Set();
+
 async function renderHistory() {
+  openViews.forEach((v) => v.destroy());
+  openViews.clear();
   const list = $('sessionList');
   const sessions = (await DB.getSessions()).sort((a, b) => b.start - a.start);
   list.innerHTML = '';
@@ -504,21 +508,24 @@ async function renderHistory() {
   }
 }
 
+const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(Math.floor(sec % 60))}`;
+
 function renderSession(s) {
   const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
   const dur = s.end - s.start;
   const live = Monitor.session && Monitor.session.id === s.id;
+  if (live) s = Monitor.session; // show the latest data of a night still being recorded
   el.querySelector('.s-date').textContent = fmtDate(s.start) + (live ? '  (recording now)' : '');
   el.querySelector('.s-meta').textContent =
     `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h`;
 
-  let loaded = false;
+  let view = null;
   el.addEventListener('toggle', async () => {
-    if (!el.open || loaded) return;
-    loaded = true;
+    if (!el.open) { if (view) view.pause(); return; }
+    if (view) { view.draw(); return; }
     const clips = (await DB.getClips(s.id)).sort((a, b) => a.start - b.start);
-    drawSessionChart(el.querySelector('.s-chart'), s);
-    window.addEventListener('resize', () => el.open && drawSessionChart(el.querySelector('.s-chart'), s));
+    view = new NightView(el, s, clips, live);
+    openViews.add(view);
 
     const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
     const loud = s.events.filter((e) => e.loudResume).length;
@@ -529,35 +536,44 @@ function renderSession(s) {
       `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
       `This app's count is only a rough sound-based estimate.</span>`;
 
+    // breathing pauses: tap to zoom the graph there and play the sound
     const evBox = el.querySelector('.s-events');
     evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
     s.events.forEach((e) => {
       const d = document.createElement('div');
-      d.className = 'list-item';
-      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` + (e.loudResume ? '<span class="tag">loud resume</span>' : '');
+      d.className = 'list-item clickable';
+      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
+        (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
+      d.onclick = () => view.focusEvent(e);
       evBox.appendChild(d);
     });
 
+    // clips: tap a row to play it on the graph
     const clipBox = el.querySelector('.s-clips');
-    clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
-    clips.forEach((c) => {
-      const d = document.createElement('div');
-      d.className = 'list-item';
-      const url = URL.createObjectURL(c.blob);
-      d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span>peak ${c.peak} dB</span>` +
-        (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
-        `<button class="dl">Download</button><button class="rm danger">Delete</button><audio controls preload="none" src="${url}"></audio>`;
-      d.querySelector('.dl').onclick = () => download(c.blob, `sleep_${fileStamp(c.start)}.wav`);
-      d.querySelector('.rm').onclick = async () => {
-        if (!confirm('Delete this clip?')) return;
-        await DB.deleteClip(c.id);
-        s.clips = s.clips.filter((x) => x.id !== c.id);
-        if (!live) await DB.putSession(s);
-        else Monitor.session.clips = Monitor.session.clips.filter((x) => x.id !== c.id);
-        d.remove();
-      };
-      clipBox.appendChild(d);
-    });
+    const renderClips = () => {
+      clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
+      clips.forEach((c, i) => {
+        const d = document.createElement('div');
+        d.className = 'list-item clickable clip-row';
+        d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span>peak ${c.peak} dB</span>` +
+          (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
+          `<span class="grow"></span><button class="dl">Download</button><button class="rm danger">Delete</button>`;
+        d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
+        d.querySelector('.dl').onclick = () => download(c.blob, `sleep_${fileStamp(c.start)}.wav`);
+        d.querySelector('.rm').onclick = async () => {
+          if (!confirm('Delete this clip?')) return;
+          await DB.deleteClip(c.id);
+          s.clips = s.clips.filter((x) => x.id !== c.id);
+          if (!live) await DB.putSession(s);
+          view.removeClip(c);
+          renderClips();
+        };
+        clipBox.appendChild(d);
+      });
+      view.markRows();
+    };
+    view.onClipsChanged = renderClips;
+    renderClips();
 
     el.querySelector('.btn-csv').onclick = () => {
       const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
@@ -578,42 +594,356 @@ function renderSession(s) {
   return el;
 }
 
-function drawSessionChart(cv, s) {
-  const { g, w, h } = setupCanvas(cv);
-  const n = s.levels.length;
-  const total = Math.max(1, s.end - s.start);
-  const xOfT = (t) => ((t - s.start) / total) * w;
+/*
+ * Interactive graph of one night + audio player.
+ * - Tap: play the clip under the finger, starting at that moment.
+ * - Drag: scroll. Pinch / wheel / +− buttons: zoom.
+ * - A playhead moves across the graph while audio plays.
+ */
+class NightView {
+  constructor(root, s, clips, live) {
+    this.root = root; this.s = s; this.clips = clips; this.live = live;
+    this.cv = root.querySelector('.s-chart');
+    this.tip = root.querySelector('.s-tip');
+    this.audio = new Audio();
+    this.audio.preload = 'auto';
+    this.urls = new Map();
+    this.cur = -1; this.selEvent = null; this.raf = 0;
+    this.t0 = s.start;
+    this.v0 = this.t0; this.v1 = this.tEnd();
 
-  // breathing pauses
-  g.fillStyle = 'rgba(255,138,101,.45)';
-  s.events.forEach((e) => { const x = xOfT(e.start); g.fillRect(x, 0, Math.max(2, xOfT(e.end) - x), h); });
+    const q = (c) => root.querySelector(c);
+    this.ui = { play: q('.p-play'), prev: q('.p-prev'), next: q('.p-next'), title: q('.p-title'),
+      seek: q('.p-seek'), time: q('.p-time'), all: q('.p-all'), zlabel: q('.z-label') };
 
-  // level: max per pixel column
-  if (n) {
-    g.fillStyle = css('--accent');
-    for (let px = 0; px < w; px++) {
-      const a = Math.floor((px / w) * n), b = Math.max(a + 1, Math.floor(((px + 1) / w) * n));
-      let m = 0;
-      for (let i = a; i < b && i < n; i++) m = Math.max(m, s.levels[i]);
-      const y = yOf(m, h);
-      g.fillRect(px, y, 1, h - y);
+    q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
+    q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
+    q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.draw(); };
+    this.ui.play.onclick = () => this.toggle();
+    this.ui.prev.onclick = () => this.play(Math.max(0, (this.cur < 0 ? 0 : this.cur - 1)));
+    this.ui.next.onclick = () => this.play(Math.min(this.clips.length - 1, this.cur + 1));
+    this.ui.seek.oninput = () => {
+      if (this.audio.duration) this.audio.currentTime = (this.ui.seek.value / 1000) * this.audio.duration;
+      this.draw();
+    };
+    this.audio.addEventListener('play', () => { this.ui.play.textContent = '⏸'; this.loop(); });
+    this.audio.addEventListener('pause', () => { this.ui.play.textContent = '▶'; this.draw(); });
+    this.audio.addEventListener('ended', () => {
+      if (this.ui.all.checked && this.cur < this.clips.length - 1) this.play(this.cur + 1);
+    });
+    this.audio.addEventListener('timeupdate', () => this.updatePlayer());
+
+    this.bindPointer();
+    this.onResize = () => { if (root.open) this.draw(); };
+    window.addEventListener('resize', this.onResize);
+    if (live) {
+      // night still being recorded: keep the graph growing if you're looking at the latest part
+      this.lastEnd = this.v1;
+      this.liveTimer = setInterval(() => {
+        if (!root.open) return;
+        const end = this.tEnd(), sp = this.v1 - this.v0, atEnd = this.v1 >= this.lastEnd - 1000;
+        this.lastEnd = end;
+        if (atEnd) { this.v1 = end; if (this.v0 !== this.t0) this.v0 = end - sp; }
+        if (this.audio.paused) this.draw();
+      }, 5000);
+    }
+    this.updatePlayer();
+    this.draw();
+  }
+
+  destroy() {
+    this.pause();
+    window.removeEventListener('resize', this.onResize);
+    clearInterval(this.liveTimer);
+    this.urls.forEach((u) => URL.revokeObjectURL(u));
+  }
+
+  tEnd() { return Math.max(this.live ? Date.now() : this.s.end, this.t0 + 60000); }
+  center() { return (this.v0 + this.v1) / 2; }
+  width() { return this.cv.clientWidth || 300; }
+  tAt(x) { return this.v0 + (x / this.width()) * (this.v1 - this.v0); }
+  xOf(t) { return ((t - this.v0) / (this.v1 - this.v0)) * this.width(); }
+  clipEnd(c) { return c.start + c.duration * 1000; }
+
+  setView(v0, v1) {
+    const t1 = this.tEnd(), span = Math.min(v1 - v0, t1 - this.t0);
+    v0 = Math.max(this.t0, Math.min(v0, t1 - span));
+    this.v0 = v0; this.v1 = v0 + span;
+    this.draw();
+  }
+
+  zoomAt(t, factor, base = [this.v0, this.v1]) {
+    const [b0, b1] = base;
+    const span = Math.max(30000, Math.min(this.tEnd() - this.t0, (b1 - b0) * factor));
+    const r = (t - b0) / (b1 - b0);
+    this.setView(t - r * span, t - r * span + span);
+  }
+
+  ensureVisible(t, span) {
+    if (t >= this.v0 && t <= this.v1 && (!span || this.v1 - this.v0 <= span * 1.5)) return;
+    const sp = span ? Math.max(span, 30000) : this.v1 - this.v0;
+    this.setView(t - sp / 2, t + sp / 2);
+  }
+
+  // ---- playback
+  url(c) {
+    if (!this.urls.has(c.id)) this.urls.set(c.id, URL.createObjectURL(c.blob));
+    return this.urls.get(c.id);
+  }
+
+  play(i, offsetSec = 0) {
+    const c = this.clips[i];
+    if (!c) return;
+    openViews.forEach((v) => v !== this && v.pause());
+    const changed = this.cur !== i;
+    this.cur = i;
+    const seek = () => { try { this.audio.currentTime = Math.min(offsetSec, Math.max(0, c.duration - 0.1)); } catch {} };
+    if (changed) {
+      this.audio.src = this.url(c);
+      this.audio.addEventListener('loadedmetadata', seek, { once: true });
+    } else seek();
+    this.audio.play().catch(() => {});
+    this.ensureVisible(c.start + offsetSec * 1000);
+    this.markRows();
+    this.updatePlayer();
+  }
+
+  toggle() {
+    if (this.cur < 0) { if (this.clips.length) this.play(0); return; }
+    if (this.audio.paused) this.audio.play().catch(() => {}); else this.audio.pause();
+  }
+
+  pause() { if (!this.audio.paused) this.audio.pause(); }
+
+  removeClip(c) {
+    const i = this.clips.indexOf(c);
+    if (i < 0) return;
+    if (i === this.cur) { this.pause(); this.audio.removeAttribute('src'); this.cur = -1; }
+    else if (i < this.cur) this.cur--;
+    this.clips.splice(i, 1);
+    if (this.urls.has(c.id)) { URL.revokeObjectURL(this.urls.get(c.id)); this.urls.delete(c.id); }
+    this.updatePlayer(); this.draw();
+  }
+
+  markRows() {
+    this.root.querySelectorAll('.clip-row').forEach((r, i) => r.classList.toggle('playing', i === this.cur));
+  }
+
+  updatePlayer() {
+    const c = this.clips[this.cur], u = this.ui;
+    u.prev.disabled = this.cur <= 0;
+    u.next.disabled = !this.clips.length || this.cur >= this.clips.length - 1;
+    u.play.disabled = !this.clips.length;
+    if (!c) {
+      u.title.textContent = this.clips.length ? 'Tap the graph or a clip to play' : 'No saved clips this night';
+      u.seek.value = 0; u.time.textContent = '0:00';
+      return;
+    }
+    const at = this.audio.currentTime || 0;
+    u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(c.start + at * 1000)} · peak ${c.peak} dB` +
+      (c.tag === 'after pause' ? ' · after pause' : '');
+    u.seek.value = c.duration ? Math.round((at / c.duration) * 1000) : 0;
+    u.time.textContent = `${fmtClock(at)} / ${fmtClock(c.duration)}`;
+  }
+
+  loop() {
+    cancelAnimationFrame(this.raf);
+    const step = () => {
+      if (this.audio.paused) return;
+      const c = this.clips[this.cur];
+      if (c) {
+        const t = c.start + this.audio.currentTime * 1000;
+        // follow the playhead when it runs off the visible part of the graph
+        if (t > this.v1 || t < this.v0) { const sp = this.v1 - this.v0; this.setView(t - sp * 0.1, t + sp * 0.9); }
+      }
+      this.draw(); this.updatePlayer();
+      this.raf = requestAnimationFrame(step);
+    };
+    this.raf = requestAnimationFrame(step);
+  }
+
+  focusEvent(e) {
+    this.selEvent = e;
+    const span = Math.max(120000, e.duration * 1000 * 5);
+    this.setView((e.start + e.end) / 2 - span / 2, (e.start + e.end) / 2 + span / 2);
+    // play the sound when breathing restarted (or the closest clip around the pause)
+    let best = -1, bestD = Infinity;
+    this.clips.forEach((c, i) => {
+      if (c.start > e.end + 30000 || this.clipEnd(c) < e.start - 30000) return;
+      const d = Math.abs(c.start - e.end) - (c.tag === 'after pause' ? 5000 : 0);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    if (best >= 0) {
+      const c = this.clips[best];
+      this.play(best, Math.max(0, (e.end - 5000 - c.start) / 1000)); // start 5 s before breathing restarted
+    }
+    this.cv.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  // ---- graph interaction
+  bindPointer() {
+    const cv = this.cv, pts = new Map();
+    let drag = null, pinch = null;
+    const xy = (e) => { const r = cv.getBoundingClientRect(); return e.clientX - r.left; };
+
+    cv.addEventListener('pointerdown', (e) => {
+      cv.setPointerCapture(e.pointerId);
+      pts.set(e.pointerId, xy(e));
+      if (pts.size === 1) drag = { x: xy(e), v0: this.v0, v1: this.v1, moved: false };
+      else if (pts.size === 2) {
+        const [a, b] = [...pts.values()];
+        pinch = { d: Math.max(20, Math.abs(a - b)), base: [this.v0, this.v1], mid: this.tAt((a + b) / 2) };
+        drag = null;
+      }
+    });
+    cv.addEventListener('pointermove', (e) => {
+      const x = xy(e);
+      if (!pts.has(e.pointerId)) { if (e.pointerType === 'mouse') this.showTip(x); return; }
+      pts.set(e.pointerId, x);
+      if (pinch && pts.size === 2) {
+        const [a, b] = [...pts.values()];
+        this.zoomAt(pinch.mid, pinch.d / Math.max(20, Math.abs(a - b)), pinch.base);
+      } else if (drag) {
+        const dx = x - drag.x;
+        if (Math.abs(dx) > 6) drag.moved = true;
+        if (drag.moved) {
+          const dt = (-dx / this.width()) * (drag.v1 - drag.v0);
+          this.setView(drag.v0 + dt, drag.v1 + dt);
+          this.tip.hidden = true;
+        }
+      }
+    });
+    const up = (e) => {
+      if (!pts.has(e.pointerId)) return;
+      pts.delete(e.pointerId);
+      if (drag && !drag.moved && e.type === 'pointerup') this.tap(xy(e));
+      if (pts.size < 2) pinch = null;
+      drag = null;
+    };
+    cv.addEventListener('pointerup', up);
+    cv.addEventListener('pointercancel', up);
+    cv.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !pts.size) this.tip.hidden = true; });
+    cv.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.zoomAt(this.tAt(xy(e)), e.deltaY > 0 ? 1.25 : 0.8);
+      this.showTip(xy(e));
+    }, { passive: false });
+  }
+
+  clipAt(x) {
+    const t = this.tAt(x), pxPerMs = this.width() / (this.v1 - this.v0);
+    let best = -1, bestD = 16; // px tolerance for tapping thin clips
+    this.clips.forEach((c, i) => {
+      const d = t < c.start ? (c.start - t) * pxPerMs : t > this.clipEnd(c) ? (t - this.clipEnd(c)) * pxPerMs : 0;
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return best;
+  }
+
+  levelAt(t) { const v = this.s.levels[Math.floor((t - this.s.start) / 1000)]; return v === undefined ? null : v; }
+
+  showTip(x, extra = '') {
+    const t = this.tAt(x), lvl = this.levelAt(t);
+    const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
+    const ci = this.clipAt(x);
+    let html = `${fmtTime(t)}${lvl !== null ? ` · ${Math.round(lvl)} dB` : ''}`;
+    if (ev) html += `<br>Breathing pause ${ev.duration}s`;
+    html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
+    if (extra) html += `<br>${extra}`;
+    this.tip.innerHTML = html;
+    this.tip.style.left = `${Math.max(70, Math.min(this.width() - 70, x))}px`;
+    this.tip.hidden = false;
+  }
+
+  tap(x) {
+    const t = this.tAt(x);
+    this.selEvent = this.s.events.find((e) => t >= e.start && t <= e.end) || null;
+    const ci = this.clipAt(x);
+    if (ci >= 0) {
+      const c = this.clips[ci];
+      const off = t >= c.start && t <= this.clipEnd(c) ? (t - c.start) / 1000 : 0;
+      this.play(ci, off);
+      this.tip.hidden = true;
+    } else {
+      this.showTip(x);
+      clearTimeout(this.tipTimer);
+      this.tipTimer = setTimeout(() => { this.tip.hidden = true; }, 2500);
+      this.draw();
     }
   }
-  // threshold
-  g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
-  const ty = yOf(s.settings.threshold, h); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke(); g.setLineDash([]);
-  // clips
-  g.fillStyle = css('--clip');
-  s.clips.forEach((c) => g.fillRect(xOfT(c.start), h - 6, Math.max(2, (c.duration * 1000 / total) * w), 6));
-  // hour labels
-  g.fillStyle = css('--muted'); g.font = '11px system-ui';
-  const first = new Date(s.start); first.setMinutes(0, 0, 0);
-  const stepMs = total > 4 * 3600000 ? 3600000 : total > 3600000 ? 1800000 : 600000;
-  for (let t = first.getTime() + stepMs; t < s.end; t += stepMs) {
-    const x = xOfT(t);
-    if (x < 0) continue;
-    g.fillRect(x, 0, 1, 4);
-    g.fillText(new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x + 2, 13);
+
+  // ---- drawing
+  draw() {
+    const { g, w, h } = setupCanvas(this.cv);
+    const s = this.s, ch = h - 18; // bottom strip for time labels
+    const y = (db) => yOf(db, ch);
+    const span = this.v1 - this.v0;
+    this.ui.zlabel.textContent = `${fmtTime(this.v0)} – ${fmtTime(this.v1)}`;
+
+    // dB grid
+    g.font = '10px system-ui'; g.fillStyle = css('--muted');
+    g.strokeStyle = 'rgba(255,255,255,.06)'; g.lineWidth = 1;
+    [40, 60, 80].forEach((db) => { g.beginPath(); g.moveTo(0, y(db)); g.lineTo(w, y(db)); g.stroke(); g.fillText(db, 2, y(db) - 2); });
+
+    // sound level (max per pixel column)
+    const n = s.levels.length;
+    g.fillStyle = css('--accent');
+    for (let px = 0; px < w; px++) {
+      const a = Math.floor((this.tAt(px) - s.start) / 1000);
+      const b = Math.max(a + 1, Math.ceil((this.tAt(px + 1) - s.start) / 1000));
+      let m = -1;
+      for (let i = Math.max(0, a); i < b && i < n; i++) m = Math.max(m, s.levels[i]);
+      if (m < 0) continue;
+      const yy = y(m);
+      g.fillRect(px, yy, 1, ch - yy);
+    }
+
+    // breathing pauses (drawn over the level so they stay visible)
+    s.events.forEach((e) => {
+      const x0 = this.xOf(e.start), x1 = this.xOf(e.end);
+      if (x1 < 0 || x0 > w) return;
+      g.fillStyle = e === this.selEvent ? 'rgba(255,138,101,.75)' : 'rgba(255,138,101,.55)';
+      g.fillRect(x0, 0, Math.max(2, x1 - x0), ch);
+    });
+
+    // threshold
+    g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
+    g.moveTo(0, y(s.settings.threshold)); g.lineTo(w, y(s.settings.threshold)); g.stroke(); g.setLineDash([]);
+
+    // clips
+    const clipCol = css('--clip');
+    this.clips.forEach((c, i) => {
+      const x0 = this.xOf(c.start), x1 = this.xOf(this.clipEnd(c));
+      if (x1 < 0 || x0 > w) return;
+      const cw = Math.max(3, x1 - x0);
+      if (i === this.cur) {
+        g.fillStyle = 'rgba(242,201,76,.18)'; g.fillRect(x0, 0, cw, ch);
+        g.fillStyle = clipCol; g.fillRect(x0, ch - 10, cw, 10);
+      } else {
+        g.fillStyle = clipCol; g.fillRect(x0, ch - 6, cw, 6);
+      }
+    });
+
+    // playhead
+    const c = this.clips[this.cur];
+    if (c) {
+      const x = this.xOf(c.start + (this.audio.currentTime || 0) * 1000);
+      if (x >= 0 && x <= w) { g.fillStyle = '#fff'; g.fillRect(x - 1, 0, 2, ch); }
+    }
+
+    // time axis: pick a step that leaves ~80 px between labels
+    const steps = [10e3, 30e3, 60e3, 120e3, 300e3, 600e3, 1800e3, 3600e3, 7200e3];
+    const stepMs = steps.find((st) => (st / span) * w >= 80) || steps[steps.length - 1];
+    const showSec = stepMs < 60e3;
+    g.fillStyle = css('--muted'); g.font = '10px system-ui';
+    const tz = new Date(this.v0).getTimezoneOffset() * 60000;
+    for (let t = Math.ceil((this.v0 - tz) / stepMs) * stepMs + tz; t <= this.v1; t += stepMs) {
+      const x = this.xOf(t);
+      g.fillRect(x, ch, 1, 4);
+      const label = new Date(t).toLocaleTimeString([], showSec ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : { hour: '2-digit', minute: '2-digit' });
+      const tw = g.measureText(label).width;
+      g.fillText(label, Math.max(0, Math.min(w - tw, x - tw / 2)), h - 3);
+    }
   }
 }
 

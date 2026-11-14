@@ -4,8 +4,9 @@ A web app you install on your phone. It listens to you while you sleep and:
 
 - **records and saves every sound louder than your threshold** (snoring, gasping, choking) as a WAV clip. Each clip includes a few seconds from before the sound started, so you hear what led up to it.
 - **detects breathing pauses**: it hears normal breathing or snoring, then silence for at least 10 s, then breathing again. Each pause is logged as a possible apnea event, along with whether breathing restarted with a loud gasp or snort.
-- shows a **timeline of each night** with sound level, threshold, pauses and saved clips, plus **pauses per hour**.
-- lets you play, download and delete clips, and **export a CSV** of the night to show your doctor.
+- shows an **interactive graph of each night** with sound level, threshold, breathing pauses and saved clips, plus **pauses per hour**.
+- lets you **replay** what happened: tap anywhere on the graph to hear that moment, or play every clip one after another to replay the night.
+- lets you download and delete clips, and **export a CSV** of the night to show your doctor.
 
 Everything stays on your phone in the browser's storage. Nothing is uploaded.
 
@@ -28,6 +29,19 @@ Then use **Add to Home Screen** (iOS Safari) or **Install app** (Android Chrome)
 3. Tap **Start monitoring**, then **Night mode** to turn the screen black. Double-tap to exit.
 4. **Leave the app open.** The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
 5. In the morning, tap **Stop** and open **History**.
+
+## Checking a night: graph and replay
+
+Open **History** and tap a night.
+
+- **Graph:** the blue area is sound level, the red dashed line is your threshold, orange bands are breathing pauses and yellow marks along the bottom are saved clips.
+- **Tap the graph** to play the sound at that moment. A white playhead moves across the graph while it plays, and the graph scrolls to follow it.
+- **Zoom and scroll:** pinch, use the mouse wheel or the **+ / −** buttons to zoom from the whole night down to 30 s. Drag sideways to scroll. **Whole night** zooms back out.
+- **Player:** play/pause, previous/next clip and a seek bar. Tick **Play all clips** to play the whole night's clips in order.
+- **Tap a breathing pause** in the list to zoom to it and play from 5 s before breathing restarted.
+- **Tap a clip** in the list to play it on the graph.
+
+You can open History while monitoring is still running. The graph keeps growing as the night is recorded.
 
 ## Settings
 

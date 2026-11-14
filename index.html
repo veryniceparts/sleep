@@ -118,9 +118,32 @@
         <span class="s-meta muted"></span>
       </summary>
       <div class="s-body">
-        <canvas class="s-chart" height="160"></canvas>
+        <div class="chart-tools">
+          <button class="z-out" aria-label="Zoom out">−</button>
+          <button class="z-in" aria-label="Zoom in">+</button>
+          <button class="z-all">Whole night</button>
+          <span class="z-label muted"></span>
+        </div>
+        <div class="chart-box">
+          <canvas class="s-chart" height="220"></canvas>
+          <div class="s-tip" hidden></div>
+        </div>
         <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
           <span class="lg evt"></span>breathing pause <span class="lg clp"></span>saved clip</div>
+        <p class="muted">Tap the graph to play the sound at that moment. Drag sideways to scroll. Pinch, use the mouse wheel or +/− to zoom.</p>
+
+        <div class="player">
+          <button class="p-prev" aria-label="Previous clip">⏮</button>
+          <button class="p-play primary" aria-label="Play">▶</button>
+          <button class="p-next" aria-label="Next clip">⏭</button>
+          <div class="p-info">
+            <div class="p-title">Tap the graph or a clip to play</div>
+            <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
+              <span class="p-time muted">0:00</span></div>
+          </div>
+        </div>
+        <label class="field check p-allwrap"><input type="checkbox" class="p-all">
+          <span>Play all clips one after another (replay the night)</span></label>
         <div class="s-summary"></div>
         <h3>Breathing pauses</h3>
         <div class="s-events"></div>
