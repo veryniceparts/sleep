@@ -105,7 +105,7 @@
       <div class="sheet-head">
         <button class="icon-btn sheet-close" aria-label="Back">‹</button>
         <h2 id="nightTitle"></h2>
-        <span></span>
+        <button id="nightMenu" class="icon-btn" aria-label="Actions">⋮</button>
       </div>
       <div id="nightPick" class="night-pick"></div>
       <div class="sheet-body" id="nightBody"></div>
@@ -130,11 +130,11 @@
         <span class="z-label muted"></span>
       </div>
       <div class="chart-box">
-        <canvas class="s-chart" height="200"></canvas>
+        <canvas class="s-chart"></canvas>
         <div class="s-tip" hidden></div>
       </div>
       <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
-        <span class="lg evt"></span>pause <span class="lg clp"></span>clip <span class="lg full"></span>full recording</div>
+        <span class="lg evt"></span>pause <span class="lg clp"></span>clip <span class="lg full"></span>full rec.</div>
 
       <div class="player">
         <button class="p-prev" aria-label="Previous">⏮</button>
@@ -145,15 +145,22 @@
           <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
             <span class="p-time muted">0:00</span></div>
         </div>
+        <button class="p-allbtn" title="Play all clips one after another">All</button>
+        <input type="checkbox" class="p-all" hidden>
       </div>
-      <label class="field check p-allwrap"><input type="checkbox" class="p-all">
-        <span>Play all clips one after another</span></label>
-      <div class="s-summary"></div>
-      <h3>Breathing pauses</h3>
-      <div class="s-events"></div>
-      <h3>Saved clips</h3>
-      <div class="s-clips"></div>
-      <div class="actions">
+
+      <div class="s-lists">
+        <div class="s-tabs">
+          <button class="tab-ev on">Pauses <span class="n-ev"></span></button>
+          <button class="tab-cl">Clips <span class="n-cl"></span></button>
+        </div>
+        <div class="s-list-body">
+          <div class="s-events"></div>
+          <div class="s-clips" hidden></div>
+        </div>
+      </div>
+
+      <div class="s-actions" hidden>
         <button class="btn-csv">Export CSV</button>
         <button class="btn-dlall">Download clips</button>
         <button class="btn-dlfull" hidden>Download full recording</button>

@@ -141,3 +141,31 @@ canvas { display: block; }
 .night-text { text-align: center; color: #3a2a20; }
 #nightClock { font-size: 3.5rem; font-weight: 300; }
 .night-tip { margin-top: 24px; font-size: .85rem; }
+
+/* ---------- night screen fits the display (no page scroll) ---------- */
+.sheet.full .sheet-panel { overflow: hidden; }
+#nightBody { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; padding-top: 4px; }
+.session { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.session .s-meta { margin: 0 0 6px; font-size: .8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; }
+.session .chart-tools { flex: none; }
+.session .chart-box { flex: 1 1 auto; min-height: 120px; }
+.session .s-chart { position: absolute; inset: 0; width: 100%; height: 100%; }
+.session .legend { flex: none; }
+.session .player { flex: none; position: static; margin-top: 8px; }
+.p-allbtn { padding: 8px 10px; font-size: .8rem; }
+.p-allbtn.on { border-color: var(--clip); color: var(--clip); }
+.s-lists { flex: 0 0 clamp(110px, 24dvh, 220px); min-height: 0; display: flex; flex-direction: column; margin-top: 8px;
+  background: var(--panel); border-radius: 12px; overflow: hidden; }
+.s-tabs { display: flex; flex: none; border-bottom: 1px solid var(--border); }
+.s-tabs button { flex: 1; background: none; border: 0; border-radius: 0; padding: 8px; color: var(--muted); font-size: .85rem; }
+.s-tabs button.on { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.s-tabs span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.s-list-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px; -webkit-overflow-scrolling: touch; }
+.s-list-body .list-item:first-child { border-top: 0; }
+.s-list-body .empty { margin: 10px 0; font-size: .85rem; }
+.list-item { flex-wrap: nowrap; padding: 6px 0; }
+.list-item button { padding: 3px 9px; }
+.s-actions { position: absolute; top: -6px; right: 0; z-index: 10; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5); min-width: 210px; }
+.s-actions[hidden] { display: none; }
+#nightBody.sheet-body { padding-bottom: calc(env(safe-area-inset-bottom) + 10px); }

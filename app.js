@@ -265,13 +265,16 @@ const WebMonitor = {
     this.running = false;
     clearInterval(this.saveTimer);
     clearInterval(this.segTimer);
-    if (this.seg) { const g = this.seg; this.seg = null; await this.endSegment(g); }
-    if (this.clip) await this.finishClip();
+    // Save the clip in progress first, and never let a slow/stuck browser API block Stop
+    // (Safari can fail to confirm MediaRecorder stops or IndexedDB writes).
+    const capped = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(r, ms))]);
+    if (this.clip) await capped(this.finishClip(), 4000);
+    if (this.seg) { const g = this.seg; this.seg = null; await capped(this.endSegment(g), 4000); }
     try { this.proc.disconnect(); this.src.disconnect(); this.sink.disconnect(); } catch {}
     this.stream.getTracks().forEach((t) => t.stop());
-    await this.ctx.close().catch(() => {});
+    capped(this.ctx.close(), 2000).catch(() => {});
     this.session.end = Date.now();
-    await this.persist();
+    await capped(this.persist(), 4000);
     const s = this.session;
     this.session = null;
     return s;
@@ -349,9 +352,14 @@ const WebMonitor = {
     const id = 'c' + Math.round(c.start) + '-' + Math.random().toString(36).slice(2, 6);
     const meta = { id, start: Math.round(c.start), duration: +(c.len / CLIP_RATE).toFixed(1), peak: Math.round(c.peak), tag: c.tag };
     this.session.clips.push(meta);
-    return DB.putClip({ ...meta, sessionId: this.session.id, blob })
-      .then(() => this.persist())
-      .catch((e) => console.error('clip save failed', e));
+    const session = this.session;
+    this.persist(); // record the clip in the night right away, even if storing its audio is slow
+    return DB.putClip({ ...meta, sessionId: session.id, blob })
+      .catch((e) => {
+        console.error('clip save failed', e);
+        meta.saveError = true;
+      })
+      .then(() => DB.putSession(session).catch(() => {}));
   },
 
   // ---- breathing pause detection
@@ -867,8 +875,9 @@ async function mountNight(el, src) {
   const meta = () => {
     const s = view.s;
     const dur = (live ? Date.now() : s.end) - s.start;
-    const full = (s.segments || []).length ? ` · full recording ${fmtMB(segBytes(s))}` : '';
-    return `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h${full}`;
+    const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
+    return `${fmtDur(dur)} · ${s.events.length} pauses (${rate(s.events.length, dur)}/h)` +
+      (longest ? ` · longest ${longest}s` : '') + (view.segs.length ? ` · full ${fmtMB(segBytes(s))}` : '');
   };
   let d;
   try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return null; }
@@ -876,18 +885,9 @@ async function mountNight(el, src) {
   openViews.add(view);
 
   const renderSummary = () => {
-    const s = view.s;
-    const dur = (live ? Date.now() : s.end) - s.start;
-    const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
-    const loud = s.events.filter((e) => e.loudResume).length;
-    el.querySelector('.s-summary').innerHTML =
-      `<b>${s.events.length}</b> breathing pauses ≥ ${s.settings.apneaGap}s ` +
-      `(<b>${rate(s.events.length, dur)}</b>/hour)` +
-      (s.events.length ? ` · longest <b>${longest}s</b> · ${loud} ended with a loud gasp/snore` : '') +
-      (view.segs.length ? '<br>Whole night recorded: tap anywhere on the graph to listen.' : '') +
-      `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
-      `This app's count is only a rough sound-based estimate.</span>`;
     el.querySelector('.s-meta').textContent = meta();
+    el.querySelector('.n-ev').textContent = view.s.events.length;
+    el.querySelector('.n-cl').textContent = view.clips.length;
     el.querySelector('.btn-dlfull').hidden = !view.segs.length;
     el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
   };
@@ -896,12 +896,12 @@ async function mountNight(el, src) {
   const evBox = el.querySelector('.s-events');
   const renderEvents = () => {
     const s = view.s;
-    evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
+    evBox.innerHTML = s.events.length ? '' : '<p class="muted empty">No breathing pauses detected.</p>';
     s.events.forEach((e) => {
       const d = document.createElement('div');
       d.className = 'list-item clickable';
-      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
-        (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
+      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s</b>` +
+        (e.loudResume ? '<span class="tag">gasp</span>' : '') + '<span class="grow"></span><span class="muted">▶</span>';
       d.onclick = () => view.focusEvent(e);
       evBox.appendChild(d);
     });
@@ -911,13 +911,13 @@ async function mountNight(el, src) {
   const clipBox = el.querySelector('.s-clips');
   const renderClips = () => {
     const clips = view.clips;
-    clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
+    clipBox.innerHTML = clips.length ? '' : '<p class="muted empty">No sounds above the threshold.</p>';
     clips.forEach((c, i) => {
       const d = document.createElement('div');
       d.className = 'list-item clickable clip-row';
-      d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span>peak ${c.peak} dB</span>` +
+      d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span class="muted">${c.peak} dB</span>` +
         (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
-        `<span class="grow"></span><button class="dl">Download</button><button class="rm danger">Delete</button>`;
+        `<span class="grow"></span><button class="dl" aria-label="Download">⬇</button><button class="rm danger" aria-label="Delete">✕</button>`;
       d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
       d.querySelector('.dl').onclick = () => src.save([{ item: c, name: `sleep_${fileStamp(c.start)}.wav` }]);
       d.querySelector('.rm').onclick = async () => {
@@ -933,6 +933,26 @@ async function mountNight(el, src) {
   };
   view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
   view.onDataChanged();
+
+  // pauses / clips tabs (the list scrolls inside its box; the screen itself doesn't scroll)
+  const tabEv = el.querySelector('.tab-ev'), tabCl = el.querySelector('.tab-cl');
+  const showTab = (clipsTab) => {
+    tabEv.classList.toggle('on', !clipsTab); tabCl.classList.toggle('on', clipsTab);
+    evBox.hidden = clipsTab; clipBox.hidden = !clipsTab;
+  };
+  tabEv.onclick = () => showTab(false);
+  tabCl.onclick = () => showTab(true);
+  showTab(!view.s.events.length && view.clips.length > 0);
+
+  // "All" = play every clip one after another
+  const allBtn = el.querySelector('.p-allbtn'), allBox = el.querySelector('.p-all');
+  allBtn.onclick = () => { allBox.checked = !allBox.checked; allBtn.classList.toggle('on', allBox.checked); };
+
+  // actions live in the ⋮ menu of the night screen
+  const actions = el.querySelector('.s-actions');
+  $('nightMenu').onclick = (e) => { e.stopPropagation(); actions.hidden = !actions.hidden; };
+  actions.addEventListener('click', () => { actions.hidden = true; });
+  el.addEventListener('click', (e) => { if (!actions.hidden && !actions.contains(e.target)) actions.hidden = true; });
 
   el.querySelector('.btn-csv').onclick = () => {
     const s = view.s;
@@ -1418,7 +1438,6 @@ class NightView {
       });
       if (best >= 0) this.play(best, Math.max(0, (e.end - 5000 - this.clips[best].start) / 1000));
     }
-    this.cv.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
   // ---- graph interaction
