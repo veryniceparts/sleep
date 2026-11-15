@@ -35,6 +35,14 @@ const FULL_MIME = (() => {
 })();
 const fmtMB = (bytes) => { const mb = bytes / 1e6; return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`; };
 const extFor = (mime) => (/mp4|aac/.test(mime) ? 'm4a' : /ogg/.test(mime) ? 'ogg' : 'webm');
+// Running inside the Android app (Capacitor) rather than a browser?
+const NATIVE = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+const plugin = (name) => (NATIVE && window.Capacitor.Plugins ? window.Capacitor.Plugins[name] : null);
+// Android app: a native background service records, so monitoring continues with the screen off / in other apps
+const SR = plugin('SleepRecorder');
+const USE_NATIVE = !!SR;
+const FULL_OK = USE_NATIVE || FULL_MIME !== null; // whole-night recording available
+
 let settings = loadSettings();
 function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sleepmon.settings') || '{}') }; }
@@ -42,6 +50,7 @@ function loadSettings() {
 }
 function saveSettings() {
   try { localStorage.setItem('sleepmon.settings', JSON.stringify(settings)); } catch {}
+  if (USE_NATIVE && NativeMonitor.running) SR.update({ settings: { ...settings } }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- storage (IndexedDB)
@@ -140,7 +149,7 @@ function encodeWav(chunks, rate) {
 const toDb = (rms) => Math.max(0, 20 * Math.log10(rms + 1e-10) + 100);
 
 // ---------------------------------------------------------------- monitor
-const Monitor = {
+const WebMonitor = {
   running: false,
   ctx: null, stream: null, src: null, proc: null, sink: null,
   session: null,
@@ -385,6 +394,8 @@ const Monitor = {
     }
   },
 
+  discard(id) { return DB.deleteSession(id); },
+
   calibrate(seconds = 10) {
     return new Promise((resolve) => {
       this.calibrating = [];
@@ -399,6 +410,66 @@ const Monitor = {
   },
 };
 
+// ---------------------------------------------------------------- native monitor (Android app)
+// Same interface as WebMonitor, but the work happens in the native SleepService; this only polls its status.
+const NativeMonitor = {
+  native: true,
+  running: false, level: 0, floor: null, session: null, clip: false, silence: false, seg: false,
+  live: [], frameSec: 0.064, bytes: 0, calibrating: null, onFrame: null, pollTimer: null,
+
+  async start({ record = settings.recordAll } = {}) {
+    const st = await SR.start({ settings: { ...settings, recordAll: !!record } });
+    if (!st.running) throw new Error('the background recorder did not start');
+    this.apply(st);
+    this.poll();
+  },
+  async stop() {
+    clearInterval(this.pollTimer); this.pollTimer = null;
+    const r = await SR.stop();
+    this.apply({ running: false });
+    const s = r.session;
+    return s ? { id: s.id, start: s.start, end: s.end, clips: { length: s.clipCount }, events: { length: s.eventCount } } : null;
+  },
+  // re-attach to a service that kept running while the app was closed or in the background
+  async resume() {
+    const st = await SR.status();
+    this.apply(st);
+    if (st.running) this.poll();
+    return st.running;
+  },
+  poll() {
+    clearInterval(this.pollTimer);
+    this.pollTimer = setInterval(async () => {
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const st = await SR.status();
+        const was = this.running;
+        this.apply(st);
+        if (was && !st.running) { clearInterval(this.pollTimer); this.pollTimer = null; onStoppedElsewhere(); }
+      } catch {}
+    }, 250);
+  },
+  apply(st) {
+    this.running = !!st.running;
+    if (!st.running) { this.session = null; this.clip = false; this.silence = false; this.seg = false; return; }
+    this.level = st.level; this.floor = st.floor; this.clip = st.clipActive; this.silence = st.silent;
+    this.seg = st.recordAll; this.bytes = st.fullBytes; this.live = st.live || []; this.frameSec = st.frameSec || 0.064;
+    this.session = { id: st.sessionId, start: st.start, clips: { length: st.clipCount }, events: { length: st.eventCount } };
+    if (this.calibrating) this.calibrating.push(st.level);
+    if (this.onFrame) this.onFrame();
+  },
+  fullBytes() { return this.bytes; },
+  setRecordAll(on) {
+    if (this.running) SR.update({ settings: { ...settings, recordAll: on } }).catch(() => {});
+    return Promise.resolve();
+  },
+  persist() {},
+  discard(id) { return SR.deleteSession({ id }); },
+  calibrate: WebMonitor.calibrate,
+};
+
+const Monitor = USE_NATIVE ? NativeMonitor : WebMonitor;
+
 // ---------------------------------------------------------------- UI helpers
 const $ = (id) => document.getElementById(id);
 const pad = (n) => String(n).padStart(2, '0');
@@ -408,9 +479,6 @@ const fmtDate = (t) => new Date(t).toLocaleString([], { weekday: 'short', month:
 const rate = (n, ms) => (ms >= 600000 ? (n / (ms / 3600000)).toFixed(1) : '–');
 const fileStamp = (t) => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; };
 
-// Running inside the Android app (Capacitor) rather than a browser?
-const NATIVE = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
-const plugin = (name) => (NATIVE && window.Capacitor.Plugins ? window.Capacitor.Plugins[name] : null);
 
 const blobToBase64 = (blob) => new Promise((resolve, reject) => {
   const r = new FileReader();
@@ -462,6 +530,7 @@ const yOf = (db, h) => h - ((Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / 
 // ---------------------------------------------------------------- monitor UI
 let wakeLock = null;
 async function keepAwake() {
+  if (USE_NATIVE) return; // the native service keeps running with the screen off
   const ka = plugin('KeepAwake');
   if (ka) { ka.keepAwake().catch(() => {}); return; }
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
@@ -493,7 +562,8 @@ function drawLive() {
     const fy = yOf(Monitor.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
   }
   if (!data.length) return;
-  const maxN = Math.ceil(LIVE_SECONDS / (4096 / (Monitor.ctx ? Monitor.ctx.sampleRate : 48000)));
+  const frameSec = Monitor.native ? Monitor.frameSec : 4096 / (Monitor.ctx ? Monitor.ctx.sampleRate : 48000);
+  const maxN = Math.ceil(LIVE_SECONDS / frameSec);
   const step = w / maxN, x0 = w - data.length * step;
   g.strokeStyle = css('--accent'); g.lineWidth = 1.5; g.beginPath();
   data.forEach((v, i) => { const x = x0 + i * step, y = yOf(v, h); i ? g.lineTo(x, y) : g.moveTo(x, y); });
@@ -534,14 +604,27 @@ $('btnStart').onclick = async () => {
   }
   keepAwake();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-  $('btnStart').hidden = true; $('btnStop').hidden = false; $('btnNight').disabled = false;
+  setRunningUI(true);
+  if (USE_NATIVE) checkBattery(true);
 };
+
+function setRunningUI(on) {
+  $('btnStart').hidden = on; $('btnStop').hidden = !on; $('btnNight').disabled = !on;
+  if (!on) { $('stState').textContent = 'Stopped'; $('stState').style.color = ''; }
+}
+
+// monitoring was stopped from the notification's Stop button
+function onStoppedElsewhere() {
+  setRunningUI(false);
+  if ($('history').classList.contains('active')) renderHistory();
+}
 
 $('btnStop').onclick = async () => {
   $('btnStop').disabled = true;
-  const s = await Monitor.stop();
-  $('btnStop').disabled = false; $('btnStop').hidden = true; $('btnStart').hidden = false; $('btnNight').disabled = true;
-  $('stState').textContent = 'Stopped'; $('stState').style.color = '';
+  let s = null;
+  try { s = await Monitor.stop(); } catch (e) { alert('Stop failed: ' + e.message); }
+  $('btnStop').disabled = false;
+  setRunningUI(false);
   allowSleep();
   if (s) alert(`Saved: ${fmtDur(s.end - s.start)}, ${s.clips.length} clips, ${s.events.length} breathing pauses.\nSee the History tab.`);
 };
@@ -550,14 +633,16 @@ $('btnCalibrate').onclick = async () => {
   const startedHere = !Monitor.running;
   if (startedHere) {
     try { await Monitor.start({ record: false }); } catch (e) { alert('Microphone error: ' + e.message); return; }
+    $('btnStart').disabled = true;
   }
   $('btnCalibrate').disabled = true; $('btnCalibrate').textContent = 'Stay quiet… measuring 10 s';
   const t = await Monitor.calibrate(10);
   if (startedHere) {
     // discard the throw-away calibration session
     const s = await Monitor.stop();
-    if (s) await DB.deleteSession(s.id);
+    if (s) await Monitor.discard(s.id).catch(() => {});
     $('stState').textContent = 'Idle';
+    $('btnStart').disabled = false;
   }
   $('btnCalibrate').disabled = false; $('btnCalibrate').textContent = 'Auto-set threshold (10 s quiet room)';
   if (t !== null) {
@@ -568,7 +653,7 @@ $('btnCalibrate').onclick = async () => {
 
 function updateRecordAllInfo() {
   const el = $('recordAllInfo');
-  if (FULL_MIME === null) { el.textContent = 'Whole-night recording is not supported by this browser.'; return; }
+  if (!FULL_OK) { el.textContent = 'Whole-night recording is not supported by this browser.'; return; }
   if (!Monitor.running) { el.textContent = settings.recordAll ? 'Will record the whole night when you start.' : ''; return; }
   const bytes = Monitor.fullBytes();
   el.textContent = Monitor.seg ? `● Recording the whole night${bytes ? ` · ${fmtMB(bytes)} so far` : ''}`
@@ -618,7 +703,7 @@ function fillSettings() {
   for (const [id, key] of Object.entries(FIELDS)) $(id).value = settings[key];
   $('setClipPauses').checked = settings.clipPauses;
   $('recordAll').checked = settings.recordAll;
-  $('recordAll').disabled = FULL_MIME === null;
+  $('recordAll').disabled = !FULL_OK;
   updateRecordAllInfo();
   updateThresholdUI();
 }
@@ -635,16 +720,72 @@ $('btnResetSettings').onclick = () => { settings = { ...DEFAULTS }; saveSettings
 
 // ---------------------------------------------------------------- history UI
 const openViews = new Set();
+const byStart = (a, b) => a.start - b.start;
+
+/*
+ * A night can come from two places:
+ *  - IndexedDB: recorded by the browser version (audio as Blobs)
+ *  - the Android background service: files on the phone (audio played via file URLs)
+ * Both are wrapped in a "source" with the same methods so the History screen doesn't care.
+ */
+function idbSource(s) {
+  const live = Monitor === WebMonitor && WebMonitor.session && WebMonitor.session.id === s.id;
+  if (live) s = WebMonitor.session; // show the latest data of a night still being recorded
+  if (!s.segments) s.segments = [];
+  return {
+    s, live, native: false,
+    async load() {
+      const [c, g] = await Promise.all([DB.getClips(s.id), DB.getSegments(s.id)]);
+      return { s, clips: c.sort(byStart), segs: g.sort(byStart) };
+    },
+    async deleteClip(c) {
+      await DB.deleteClip(c.id);
+      s.clips = s.clips.filter((x) => x.id !== c.id);
+      if (!live) await DB.putSession(s);
+    },
+    async deleteFull() { await DB.deleteSegments(s.id); s.segments = []; await DB.putSession(s); },
+    deleteSession: () => DB.deleteSession(s.id),
+    save: (items) => downloadMany(items.map((i) => ({ blob: i.item.blob, name: i.name }))),
+  };
+}
+
+function nativeSource(s) {
+  const src = {
+    s, live: !!s.live, native: true,
+    async load() {
+      const { session } = await SR.getSession({ id: s.id });
+      const toUrl = (x) => ({ ...x, src: window.Capacitor.convertFileSrc(x.path) });
+      session.segments = session.segments || [];
+      src.s = session;
+      return { s: session, clips: session.clips.map(toUrl).sort(byStart), segs: session.segments.map(toUrl).sort(byStart) };
+    },
+    async deleteClip(c) { await SR.deleteClip({ sessionId: s.id, clipId: c.id }); src.s.clips = src.s.clips.filter((x) => x.id !== c.id); },
+    async deleteFull() { await SR.deleteFull({ sessionId: s.id }); src.s.segments = []; },
+    deleteSession: () => SR.deleteSession({ id: s.id }),
+    save: (items) => SR.share({ files: items.map((i) => ({ path: i.item.path, name: i.name })) }).catch((e) => alert(e.message)),
+  };
+  return src;
+}
 
 async function renderHistory() {
   openViews.forEach((v) => v.destroy());
   openViews.clear();
   const list = $('sessionList');
-  const sessions = (await DB.getSessions()).sort((a, b) => b.start - a.start);
+  const sources = (await DB.getSessions()).map(idbSource);
+  let nativeBytes = 0;
+  if (USE_NATIVE) {
+    try {
+      const { sessions } = await SR.listSessions();
+      sessions.forEach((s) => { nativeBytes += s.bytes || 0; sources.push(nativeSource(s)); });
+    } catch (e) { console.error(e); }
+  }
+  sources.sort((a, b) => b.s.start - a.s.start);
   list.innerHTML = '';
-  if (!sessions.length) { list.innerHTML = '<p class="muted">No recordings yet. Start monitoring on the Monitor tab.</p>'; }
-  for (const s of sessions) list.appendChild(renderSession(s));
-  if (navigator.storage && navigator.storage.estimate) {
+  if (!sources.length) { list.innerHTML = '<p class="muted">No recordings yet. Start monitoring on the Monitor tab.</p>'; }
+  for (const src of sources) list.appendChild(renderSession(src));
+  if (USE_NATIVE) {
+    $('storageInfo').textContent = `${fmtMB(nativeBytes)} of recordings`;
+  } else if (navigator.storage && navigator.storage.estimate) {
     const { usage = 0, quota = 0 } = await navigator.storage.estimate();
     $('storageInfo').textContent = `${(usage / 1e6).toFixed(1)} MB used of ${(quota / 1e9).toFixed(1)} GB`;
   }
@@ -653,28 +794,30 @@ async function renderHistory() {
 const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(Math.floor(sec % 60))}`;
 const segBytes = (s) => (s.segments || []).reduce((n, g) => n + (g.size || 0), 0);
 
-function renderSession(s) {
+function renderSession(src) {
   const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
-  const live = Monitor.session && Monitor.session.id === s.id;
-  if (live) s = Monitor.session; // show the latest data of a night still being recorded
-  if (!s.segments) s.segments = [];
+  const live = src.live;
+  let view = null;
+  const cur = () => (view ? view.s : src.s);
   const meta = () => {
+    const s = cur();
     const dur = (live ? Date.now() : s.end) - s.start;
-    const full = s.segments.length ? ` · full recording ${fmtMB(segBytes(s))}` : '';
+    const full = (s.segments || []).length ? ` · full recording ${fmtMB(segBytes(s))}` : '';
     return `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h${full}`;
   };
-  el.querySelector('.s-date').textContent = fmtDate(s.start) + (live ? '  (recording now)' : '');
+  el.querySelector('.s-date').textContent = fmtDate(src.s.start) + (live ? '  (recording now)' : '');
   el.querySelector('.s-meta').textContent = meta();
 
-  let view = null;
   el.addEventListener('toggle', async () => {
     if (!el.open) { if (view) view.pause(); return; }
     if (view) { view.draw(); return; }
-    const [clips, segs] = await Promise.all([DB.getClips(s.id), DB.getSegments(s.id)]);
-    view = new NightView(el, s, clips.sort((a, b) => a.start - b.start), segs.sort((a, b) => a.start - b.start), live);
+    let d;
+    try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return; }
+    view = new NightView(el, d.s, d.clips, d.segs, src);
     openViews.add(view);
 
     const renderSummary = () => {
+      const s = view.s;
       const dur = (live ? Date.now() : s.end) - s.start;
       const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
       const loud = s.events.filter((e) => e.loudResume).length;
@@ -693,6 +836,7 @@ function renderSession(s) {
     // breathing pauses: tap to zoom the graph there and play the sound
     const evBox = el.querySelector('.s-events');
     const renderEvents = () => {
+      const s = view.s;
       evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
       s.events.forEach((e) => {
         const d = document.createElement('div');
@@ -716,12 +860,10 @@ function renderSession(s) {
           (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
           `<span class="grow"></span><button class="dl">Download</button><button class="rm danger">Delete</button>`;
         d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
-        d.querySelector('.dl').onclick = () => download(c.blob, `sleep_${fileStamp(c.start)}.wav`);
+        d.querySelector('.dl').onclick = () => src.save([{ item: c, name: `sleep_${fileStamp(c.start)}.wav` }]);
         d.querySelector('.rm').onclick = async () => {
           if (!confirm('Delete this clip?')) return;
-          await DB.deleteClip(c.id);
-          s.clips = s.clips.filter((x) => x.id !== c.id);
-          if (!live) await DB.putSession(s);
+          await src.deleteClip(c);
           view.removeClip(c);
           renderClips(); renderSummary();
         };
@@ -734,30 +876,29 @@ function renderSession(s) {
     view.onDataChanged();
 
     el.querySelector('.btn-csv').onclick = () => {
+      const s = view.s;
       const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
       s.events.forEach((e) => rows.push(['pause', new Date(e.start).toISOString(), new Date(e.end).toISOString(), e.duration, '', e.loudResume ? 'loud resume' : '']));
       view.clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
       download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
     };
     el.querySelector('.btn-dlall').onclick = async () => {
-      if (view.clips.length) await downloadMany(view.clips.map((c) => ({ blob: c.blob, name: `sleep_${fileStamp(c.start)}.wav` })));
+      if (view.clips.length) await src.save(view.clips.map((c) => ({ item: c, name: `sleep_${fileStamp(c.start)}.wav` })));
     };
     el.querySelector('.btn-dlfull').onclick = async () => {
       if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Save them all?`)) return;
-      await downloadMany(view.segs.map((g) => ({ blob: g.blob, name: `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}` })));
+      await src.save(view.segs.map((g) => ({ item: g, name: `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}` })));
     };
     el.querySelector('.btn-delfull').onclick = async () => {
-      if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(s))})? Saved clips and the graph are kept.`)) return;
-      await DB.deleteSegments(s.id);
-      s.segments = [];
-      await DB.putSession(s);
+      if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(view.s))})? Saved clips and the graph are kept.`)) return;
+      await src.deleteFull();
       view.clearSegments();
       renderSummary();
     };
     el.querySelector('.btn-del').onclick = async () => {
       if (live) { alert('Stop monitoring first.'); return; }
       if (!confirm('Delete this whole night, including all clips and the full recording?')) return;
-      await DB.deleteSession(s.id);
+      await src.deleteSession();
       renderHistory();
     };
   });
@@ -773,8 +914,8 @@ function renderSession(s) {
  * Drag: scroll. Pinch / wheel / +− buttons: zoom. A playhead follows playback.
  */
 class NightView {
-  constructor(root, s, clips, segs, live) {
-    this.root = root; this.s = s; this.clips = clips; this.segs = segs; this.live = live;
+  constructor(root, s, clips, segs, src) {
+    this.root = root; this.s = s; this.clips = clips; this.segs = segs; this.src = src; this.live = src.live;
     this.cv = root.querySelector('.s-chart');
     this.tip = root.querySelector('.s-tip');
     this.audio = new Audio();
@@ -809,20 +950,17 @@ class NightView {
     this.bindPointer();
     this.onResize = () => { if (root.open) this.draw(); };
     window.addEventListener('resize', this.onResize);
-    if (live) {
-      // night still being recorded: pick up new clips/files and keep the graph growing
+    this.counts = this.countKey();
+    if (this.live) {
+      // night still being recorded: pick up new clips/files/pauses and keep the graph growing
       this.lastEnd = this.v1;
       this.liveTimer = setInterval(() => {
-        if (!root.open) return;
+        if (!root.open || document.visibilityState !== 'visible') return;
         const end = this.tEnd(), sp = this.v1 - this.v0, atEnd = this.v1 >= this.lastEnd - 1000;
         this.lastEnd = end;
         if (atEnd) { this.v1 = end; if (this.v0 !== this.t0) this.v0 = end - sp; }
-        if (this.s.clips.length !== this.clips.length || this.s.segments.length !== this.segs.length) this.reload();
-        else if (this.onDataChanged && this.s.events.length !== this.evCount) this.onDataChanged();
-        this.evCount = this.s.events.length;
-        if (this.audio.paused) this.draw();
+        this.reload();
       }, 5000);
-      this.evCount = s.events.length;
     }
     this.updatePlayer();
     this.draw();
@@ -835,15 +973,19 @@ class NightView {
     this.urls.forEach((u) => URL.revokeObjectURL(u));
   }
 
+  countKey() { return [this.clips.length, this.segs.length, this.s.events.length].join(); }
+
   async reload() {
+    let d;
+    try { d = await this.src.load(); } catch { return; }
     const it = this.item();
-    const [clips, segs] = await Promise.all([DB.getClips(this.s.id), DB.getSegments(this.s.id)]);
-    this.clips = clips.sort((a, b) => a.start - b.start);
-    this.segs = segs.sort((a, b) => a.start - b.start);
+    this.s = d.s; this.clips = d.clips; this.segs = d.segs;
     if (it) this.cur = this.list().findIndex((x) => x.id === it.id);
     if (this.cur < 0) this.mode = null;
-    if (this.onDataChanged) this.onDataChanged();
-    this.updatePlayer(); this.draw();
+    const key = this.countKey();
+    if (key !== this.counts) { this.counts = key; if (this.onDataChanged) this.onDataChanged(); }
+    this.updatePlayer();
+    if (this.audio.paused) this.draw();
   }
 
   tEnd() { return Math.max(this.live ? Date.now() : this.s.end, this.t0 + 60000); }
@@ -880,6 +1022,7 @@ class NightView {
 
   // ---- playback
   url(it) {
+    if (it.src) return it.src; // file on the phone (Android app)
     if (!this.urls.has(it.id)) this.urls.set(it.id, URL.createObjectURL(it.blob));
     return this.urls.get(it.id);
   }
@@ -1236,10 +1379,36 @@ class NightView {
   }
 }
 
+// ---------------------------------------------------------------- Android background mode
+async function checkBattery(prompt) {
+  if (!USE_NATIVE) return;
+  try {
+    const { ignoring } = await SR.batteryStatus();
+    $('btnBattery').hidden = ignoring;
+    if (!ignoring && prompt && !sessionStorage.getItem('sleepmon.batteryAsked')) {
+      sessionStorage.setItem('sleepmon.batteryAsked', '1');
+      if (confirm('To make sure Android never stops monitoring during the night, allow Sleep Monitor to run without battery restrictions?')) {
+        SR.openBatterySettings();
+      }
+    }
+  } catch {}
+}
+if (USE_NATIVE) {
+  $('bgHint').hidden = false;
+  $('webHint').hidden = true;
+  $('btnBattery').onclick = () => SR.openBatterySettings();
+  const reattach = async () => { if (await NativeMonitor.resume().catch(() => false)) setRunningUI(true); else if (!$('btnStop').hidden) setRunningUI(false); };
+  reattach();
+  checkBattery(false);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { reattach(); checkBattery(false); }
+  });
+}
+
 // ---------------------------------------------------------------- boot
 fillSettings();
 drawLive();
-window.addEventListener('beforeunload', (e) => { if (Monitor.running) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('beforeunload', (e) => { if (Monitor.running && !USE_NATIVE) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
 if ('serviceWorker' in navigator && location.protocol !== 'file:' && !NATIVE) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }

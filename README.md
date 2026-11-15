@@ -21,6 +21,8 @@ Open the link on your Android phone, open the downloaded file and tap **Install*
 
 A new APK is built automatically by GitHub Actions on every push (see *Actions* and *Releases*). All builds are signed with the same key, so a new version installs over the old one and keeps your recordings. In the app, **Download** buttons open Android's share sheet, so you can save files to Files or Drive, or send them by email or a messaging app.
 
+**Screen off and other apps:** in the Android app, monitoring runs in a background service, shown by a "Monitoring your sleep" notification with a Stop button. You can lock the phone or use other apps all night. It records the microphone natively (clips as WAV, the whole night as AAC .m4a files) and does the same breathing-pause detection. When you tap Start the first time, allow the microphone and notifications. The app also offers to turn off battery restrictions, so aggressive power savers (Samsung, Xiaomi, Huawei, ...) don't stop it during the night.
+
 iPhone can't install APKs. Use the web version below and *Add to Home Screen*.
 
 ## Running it as a web app
@@ -39,7 +41,7 @@ Then use **Add to Home Screen** (iOS Safari) or **Install app** (Android Chrome)
 2. In a quiet room, tap **Auto-set threshold** and stay silent for 10 s. This sets the threshold to the room level + 15 dB. Fine-tune it with the slider.
 3. Optional: tick **Record the whole night** if you want to be able to listen to any moment later.
 4. Tap **Start monitoring**, then **Night mode** to turn the screen black. Double-tap to exit.
-5. **Leave the app open.** The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
+5. **Android app:** lock the phone or use other apps as you like. **Web version:** leave the page open. The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
 6. In the morning, tap **Stop** and open **History**.
 
 ## Checking a night: graph and replay

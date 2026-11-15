@@ -62,8 +62,12 @@
         <button id="btnNight" disabled>Night mode (dark screen)</button>
       </div>
 
-      <p class="hint">Put the phone 0.5–1 m from your head, plugged into a charger, and keep this page open.
+      <p class="hint" id="webHint">Put the phone 0.5–1 m from your head, plugged into a charger, and keep this page open.
         The screen stays awake while monitoring. Night mode turns the screen black but keeps recording.</p>
+      <p class="hint" id="bgHint" hidden>Put the phone 0.5–1 m from your head, ideally on a charger.
+        <b>You can lock the screen or switch to other apps.</b> Monitoring keeps running in the background, shown by the
+        “Monitoring your sleep” notification. Stop it here or from the notification.</p>
+      <div class="actions"><button id="btnBattery" hidden>Allow running without battery restrictions</button></div>
       <p class="disclaimer">⚠️ This is not a medical device and cannot diagnose sleep apnea. Use the recordings to
         talk to a doctor; a sleep study is the only reliable diagnosis.</p>
     </section>
