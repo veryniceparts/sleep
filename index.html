@@ -145,19 +145,17 @@
           <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
             <span class="p-time muted">0:00</span></div>
         </div>
-        <button class="p-allbtn" title="Play all clips one after another">All</button>
-        <input type="checkbox" class="p-all" hidden>
       </div>
 
       <div class="s-lists">
-        <div class="s-tabs">
-          <button class="tab-ev on">Pauses <span class="n-ev"></span></button>
-          <button class="tab-cl">Clips <span class="n-cl"></span></button>
-        </div>
-        <div class="s-list-body">
-          <div class="s-events"></div>
-          <div class="s-clips" hidden></div>
-        </div>
+        <section class="s-panel">
+          <div class="s-panel-head">Breathing pauses <span class="n-ev"></span></div>
+          <div class="s-list-body s-events"></div>
+        </section>
+        <section class="s-panel">
+          <div class="s-panel-head">Clips <span class="n-cl"></span></div>
+          <div class="s-list-body s-clips"></div>
+        </section>
       </div>
 
       <div class="s-actions" hidden>

@@ -182,6 +182,9 @@ const WebMonitor = {
     this.sink = this.ctx.createGain();
     this.sink.gain.value = 0;
     this.src.connect(this.proc); this.proc.connect(this.sink); this.sink.connect(this.ctx.destination);
+    this.analyser = this.ctx.createAnalyser(); // lets the meter read the level every screen frame
+    this.analyser.fftSize = 2048;
+    this.src.connect(this.analyser);
     this.proc.onaudioprocess = (e) => this.process(e.inputBuffer.getChannelData(0), this.ctx.sampleRate);
 
     const now = Date.now();
@@ -455,7 +458,7 @@ const NativeMonitor = {
         this.apply(st);
         if (was && !st.running) { clearInterval(this.pollTimer); this.pollTimer = null; onStoppedElsewhere(); }
       } catch {}
-    }, 250);
+    }, 120);
   },
   apply(st) {
     this.running = !!st.running;
@@ -553,6 +556,10 @@ const Preview = {
       const sink = ctx.createGain();
       sink.gain.value = 0;
       src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      src.connect(analyser);
+      this.analyser = analyser;
       proc.onaudioprocess = (e) => this.process(e.inputBuffer.getChannelData(0));
       Object.assign(this, { ctx, stream, src, proc, sink, on: true, live: [], floor: null, frameSec: 4096 / ctx.sampleRate });
       if (ctx.state === 'suspended') {
@@ -613,23 +620,71 @@ function updateThresholdUI() {
 
 const levelSource = () => (Monitor.running ? Monitor : Preview);
 
-function drawLive() {
-  const m = levelSource();
-  const { g, w, h } = setupCanvas($('liveChart'));
-  g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
-  const ty = yOf(settings.threshold, h); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke(); g.setLineDash([]);
-  if (m.floor !== null && m.floor !== undefined) {
-    g.strokeStyle = css('--muted'); g.globalAlpha = 0.5; g.beginPath();
-    const fy = yOf(m.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
-  }
-  const data = m.live || [];
-  if (!data.length) return;
-  const frameSec = m.frameSec || 4096 / (m.ctx ? m.ctx.sampleRate : 48000);
-  const step = w / Math.ceil(LIVE_SECONDS / frameSec), x0 = w - data.length * step;
-  g.strokeStyle = Monitor.running ? css('--accent') : css('--muted'); g.lineWidth = 1.5; g.beginPath();
-  data.forEach((v, i) => { const x = x0 + i * step, y = yOf(v, h); i ? g.lineTo(x, y) : g.moveTo(x, y); });
-  g.stroke();
-}
+// Smooth meter: the dB number, bar and live graph are redrawn every screen frame (~60 fps).
+// In the browser the level is read straight from the microphone each frame; in the Android app the
+// background recorder's level (polled ~8x/s) is eased so it moves smoothly.
+const Meter = {
+  shown: null, hist: [], lastPush: 0, buf: null, lastText: 0,
+  target(m) {
+    if (!(Monitor.running || Preview.on)) return null;
+    const an = m.analyser;
+    if (an && m.ctx && m.ctx.state === 'running') {
+      if (!this.buf || this.buf.length !== an.fftSize) this.buf = new Float32Array(an.fftSize);
+      an.getFloatTimeDomainData(this.buf);
+      let sum = 0;
+      for (let i = 0; i < this.buf.length; i++) sum += this.buf[i] * this.buf[i];
+      return toDb(Math.sqrt(sum / this.buf.length));
+    }
+    return Number.isFinite(m.level) ? m.level : null;
+  },
+  frame(now) {
+    const m = levelSource(), t = this.target(m);
+    if (t !== null) {
+      // rise quickly, fall gently
+      this.shown = this.shown === null ? t : this.shown + (t - this.shown) * (t > this.shown ? 0.5 : 0.12);
+      if (now - this.lastPush >= 33) { this.hist.push([now, this.shown]); this.lastPush = now; }
+    }
+    while (this.hist.length && now - this.hist[0][0] > LIVE_SECONDS * 1000) this.hist.shift();
+    const v = this.shown;
+    if (v !== null) {
+      if (now - this.lastText > 150) { $('levelNow').textContent = Math.round(v); this.lastText = now; }
+      $('meterBar').style.width = `${((Math.min(DB_MAX, Math.max(DB_MIN, v)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
+    }
+    if (m.floor !== null && m.floor !== undefined) {
+      $('meterFloor').style.left = `${((Math.max(DB_MIN, m.floor + settings.breathMargin) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
+    }
+    this.draw(now, m);
+  },
+  draw(now = performance.now(), m = levelSource()) {
+    const { g, w, h } = setupCanvas($('liveChart'));
+    g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.lineWidth = 1; g.beginPath();
+    const ty = yOf(settings.threshold, h); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke(); g.setLineDash([]);
+    if (m.floor !== null && m.floor !== undefined) {
+      g.strokeStyle = css('--muted'); g.globalAlpha = 0.5; g.beginPath();
+      const fy = yOf(m.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
+    }
+    if (!this.hist.length) return;
+    // scrolls continuously: x is based on time, not on sample count
+    const span = LIVE_SECONDS * 1000, pts = this.hist;
+    g.beginPath();
+    pts.forEach(([t, lv], i) => { const x = w - ((now - t) / span) * w, y = yOf(lv, h); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.strokeStyle = Monitor.running ? css('--accent') : css('--muted'); g.lineWidth = 1.5; g.lineJoin = 'round';
+    g.stroke();
+    // soft fill under the line
+    g.lineTo(w, h); g.lineTo(w - ((now - pts[0][0]) / span) * w, h); g.closePath();
+    g.fillStyle = Monitor.running ? 'rgba(143,180,255,.14)' : 'rgba(138,148,168,.10)';
+    g.fill();
+  },
+  start() {
+    const step = (now) => {
+      requestAnimationFrame(step);
+      if (document.visibilityState !== 'visible' || !$('nightOverlay').hidden || !$('nightSheet').hidden) return;
+      this.frame(now);
+    };
+    requestAnimationFrame(step);
+  },
+};
+const drawLive = () => Meter.draw();
 
 let lastUi = 0, calib = null, lastSaved = '';
 function onLevelFrame() {
@@ -638,11 +693,6 @@ function onLevelFrame() {
   lastUi = now;
   const m = levelSource(), s = Monitor.running ? Monitor.session : null;
   if (calib) calib.push(m.level);
-  $('levelNow').textContent = Number.isFinite(m.level) ? m.level.toFixed(0) : '--';
-  $('meterBar').style.width = `${((Math.min(DB_MAX, Math.max(DB_MIN, m.level || 0)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
-  if (m.floor !== null && m.floor !== undefined) {
-    $('meterFloor').style.left = `${((Math.max(DB_MIN, m.floor + settings.breathMargin) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
-  }
   let state, info;
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
@@ -655,7 +705,6 @@ function onLevelFrame() {
   $('stState').style.color = s && Monitor.clip ? css('--danger') : '';
   $('stInfo').textContent = info;
   updateRecordAllInfo();
-  if ($('nightOverlay').hidden && $('nightSheet').hidden) drawLive();
 }
 Monitor.onFrame = onLevelFrame;
 Preview.onFrame = onLevelFrame;
@@ -934,20 +983,6 @@ async function mountNight(el, src) {
   view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
   view.onDataChanged();
 
-  // pauses / clips tabs (the list scrolls inside its box; the screen itself doesn't scroll)
-  const tabEv = el.querySelector('.tab-ev'), tabCl = el.querySelector('.tab-cl');
-  const showTab = (clipsTab) => {
-    tabEv.classList.toggle('on', !clipsTab); tabCl.classList.toggle('on', clipsTab);
-    evBox.hidden = clipsTab; clipBox.hidden = !clipsTab;
-  };
-  tabEv.onclick = () => showTab(false);
-  tabCl.onclick = () => showTab(true);
-  showTab(!view.s.events.length && view.clips.length > 0);
-
-  // "All" = play every clip one after another
-  const allBtn = el.querySelector('.p-allbtn'), allBox = el.querySelector('.p-all');
-  allBtn.onclick = () => { allBox.checked = !allBox.checked; allBtn.classList.toggle('on', allBox.checked); };
-
   // actions live in the ⋮ menu of the night screen
   const actions = el.querySelector('.s-actions');
   $('nightMenu').onclick = (e) => { e.stopPropagation(); actions.hidden = !actions.hidden; };
@@ -1164,7 +1199,7 @@ class NightView {
 
     const q = (c) => root.querySelector(c);
     this.ui = { play: q('.p-play'), prev: q('.p-prev'), next: q('.p-next'), title: q('.p-title'),
-      seek: q('.p-seek'), time: q('.p-time'), all: q('.p-all'), zlabel: q('.z-label') };
+      seek: q('.p-seek'), time: q('.p-time'), zlabel: q('.z-label') };
 
     q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
     q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
@@ -1315,8 +1350,6 @@ class NightView {
       const next = this.segs[this.cur + 1];
       // continue straight into the next 10-minute file (they overlap by a fraction of a second)
       if (next && next.start - this.endOf(it) < 5000) this.playItem('seg', this.cur + 1, Math.max(0, (this.endOf(it) - next.start) / 1000));
-    } else if (this.ui.all.checked && this.cur < this.clips.length - 1) {
-      this.playAt(this.clips[this.cur + 1].start, this.cur + 1);
     }
   }
 
@@ -1379,7 +1412,16 @@ class NightView {
     else if (this.mode === 'seg') { const t = this.curT(); idx = this.clips.findIndex((c) => t >= c.start && t <= this.endOf(c)); }
     if (idx === this.rowMark) return;
     this.rowMark = idx;
-    this.root.querySelectorAll('.clip-row').forEach((r, i) => r.classList.toggle('playing', i === idx));
+    this.root.querySelectorAll('.clip-row').forEach((r, i) => {
+      r.classList.toggle('playing', i === idx);
+      if (i === idx) {
+        // keep the playing clip visible inside the clips window (without moving the page)
+        const box = r.parentElement;
+        if (r.offsetTop < box.scrollTop || r.offsetTop + r.offsetHeight > box.scrollTop + box.clientHeight) {
+          box.scrollTo({ top: r.offsetTop - box.clientHeight / 2 + r.offsetHeight / 2, behavior: 'smooth' });
+        }
+      }
+    });
   }
 
   updatePlayer() {
@@ -1653,7 +1695,7 @@ setInterval(() => { if (Monitor.running && document.visibilityState === 'visible
 // ---------------------------------------------------------------- boot
 fillSettings();
 setRunningUI(false);
-drawLive();
+Meter.start();
 renderWeek();
 refreshState();
 window.addEventListener('beforeunload', (e) => { if (Monitor.running && !USE_NATIVE) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
