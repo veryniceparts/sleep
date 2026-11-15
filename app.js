@@ -527,22 +527,74 @@ const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v
 const DB_MIN = 20, DB_MAX = 100;
 const yOf = (db, h) => h - ((Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / (DB_MAX - DB_MIN)) * h;
 
+// ---------------------------------------------------------------- live level preview
+// The meter and graph work as soon as the app opens (before Start). Nothing is recorded in preview.
+const Preview = {
+  on: false, level: 0, floor: null, live: [], frameSec: 0.085, onFrame: null, starting: null,
+  start() {
+    if (this.on || this.starting || Monitor.running || document.visibilityState !== 'visible') return this.starting || Promise.resolve();
+    this.starting = (async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      });
+      if (Monitor.running || document.visibilityState !== 'visible') { stream.getTracks().forEach((t) => t.stop()); return; }
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      const src = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const sink = ctx.createGain();
+      sink.gain.value = 0;
+      src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+      proc.onaudioprocess = (e) => this.process(e.inputBuffer.getChannelData(0));
+      Object.assign(this, { ctx, stream, src, proc, sink, on: true, live: [], floor: null, frameSec: 4096 / ctx.sampleRate });
+      if (ctx.state === 'suspended') {
+        // browsers only allow audio after a tap
+        ctx.resume().catch(() => {});
+        const resume = () => { ctx.resume().catch(() => {}); window.removeEventListener('pointerdown', resume, true); };
+        window.addEventListener('pointerdown', resume, true);
+      }
+    })().finally(() => { this.starting = null; });
+    return this.starting;
+  },
+  stop() {
+    if (!this.on) return;
+    this.on = false;
+    try { this.proc.disconnect(); this.src.disconnect(); this.sink.disconnect(); } catch {}
+    this.stream.getTracks().forEach((t) => t.stop());
+    this.ctx.close().catch(() => {});
+  },
+  process(input) {
+    let sum = 0;
+    for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+    const level = toDb(Math.sqrt(sum / input.length));
+    this.level = level;
+    if (this.floor === null) this.floor = level;
+    else if (level < this.floor) this.floor += (level - this.floor) * 0.3;
+    else this.floor += (level - this.floor) * 0.0005;
+    this.live.push(level);
+    const max = Math.ceil(LIVE_SECONDS / this.frameSec);
+    if (this.live.length > max) this.live.splice(0, this.live.length - max);
+    if (this.onFrame) this.onFrame();
+  },
+};
+
+function startPreview() {
+  Preview.start().catch((e) => {
+    if (Monitor.running) return;
+    $('stState').textContent = 'Microphone blocked';
+    $('stInfo').textContent = e && e.name === 'NotAllowedError' ? 'Allow microphone access to see the level' : 'Microphone not available here';
+  });
+}
+
 // ---------------------------------------------------------------- monitor UI
 let wakeLock = null;
 async function keepAwake() {
   if (USE_NATIVE) return; // the native service keeps running with the screen off
-  const ka = plugin('KeepAwake');
-  if (ka) { ka.keepAwake().catch(() => {}); return; }
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
 }
 function allowSleep() {
-  const ka = plugin('KeepAwake');
-  if (ka) ka.allowSleep().catch(() => {});
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && Monitor.running) keepAwake();
-});
 
 function updateThresholdUI() {
   $('thresholdVal').textContent = settings.threshold;
@@ -551,113 +603,124 @@ function updateThresholdUI() {
   $('meterThreshold').style.left = `${((settings.threshold - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
 }
 
+const levelSource = () => (Monitor.running ? Monitor : Preview);
+
 function drawLive() {
-  const cv = $('liveChart');
-  const { g, w, h } = setupCanvas(cv);
-  const data = Monitor.live;
+  const m = levelSource();
+  const { g, w, h } = setupCanvas($('liveChart'));
   g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
   const ty = yOf(settings.threshold, h); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke(); g.setLineDash([]);
-  if (Monitor.floor !== null) {
+  if (m.floor !== null && m.floor !== undefined) {
     g.strokeStyle = css('--muted'); g.globalAlpha = 0.5; g.beginPath();
-    const fy = yOf(Monitor.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
+    const fy = yOf(m.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
   }
+  const data = m.live || [];
   if (!data.length) return;
-  const frameSec = Monitor.native ? Monitor.frameSec : 4096 / (Monitor.ctx ? Monitor.ctx.sampleRate : 48000);
-  const maxN = Math.ceil(LIVE_SECONDS / frameSec);
-  const step = w / maxN, x0 = w - data.length * step;
-  g.strokeStyle = css('--accent'); g.lineWidth = 1.5; g.beginPath();
+  const frameSec = m.frameSec || 4096 / (m.ctx ? m.ctx.sampleRate : 48000);
+  const step = w / Math.ceil(LIVE_SECONDS / frameSec), x0 = w - data.length * step;
+  g.strokeStyle = Monitor.running ? css('--accent') : css('--muted'); g.lineWidth = 1.5; g.beginPath();
   data.forEach((v, i) => { const x = x0 + i * step, y = yOf(v, h); i ? g.lineTo(x, y) : g.moveTo(x, y); });
   g.stroke();
 }
 
-let lastUi = 0;
-Monitor.onFrame = () => {
+let lastUi = 0, calib = null, lastSaved = '';
+function onLevelFrame() {
   const now = performance.now();
   if (now - lastUi < 100) return;
   lastUi = now;
-  const s = Monitor.session;
-  $('levelNow').textContent = Monitor.level.toFixed(0);
-  $('meterBar').style.width = `${((Math.min(DB_MAX, Math.max(DB_MIN, Monitor.level)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
-  $('meterFloor').style.left = `${((Math.max(DB_MIN, Monitor.floor + settings.breathMargin) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
-  $('stState').textContent = Monitor.calibrating ? 'Calibrating…' : Monitor.clip ? '● Recording' : Monitor.silence ? 'Quiet' : 'Listening';
-  $('stState').style.color = Monitor.clip ? css('--danger') : '';
-  if (s) {
+  const m = levelSource(), s = Monitor.running ? Monitor.session : null;
+  if (calib) calib.push(m.level);
+  $('levelNow').textContent = Number.isFinite(m.level) ? m.level.toFixed(0) : '--';
+  $('meterBar').style.width = `${((Math.min(DB_MAX, Math.max(DB_MIN, m.level || 0)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
+  if (m.floor !== null && m.floor !== undefined) {
+    $('meterFloor').style.left = `${((Math.max(DB_MIN, m.floor + settings.breathMargin) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
+  }
+  let state, info;
+  if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
+  else if (s) {
+    state = Monitor.clip ? '● Recording sound' : Monitor.silence ? 'Quiet' : 'Monitoring';
     const el = Date.now() - s.start;
-    $('stElapsed').textContent = fmtDur(el);
-    $('stClips').textContent = s.clips.length + (Monitor.clip ? ' +1' : '');
-    $('stEvents').textContent = s.events.length;
-    $('stRate').textContent = rate(s.events.length, el);
-    $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses` + (Monitor.seg ? ' · recording all' : '');
-  }
+    info = `${fmtDur(el)} · ${s.events.length} pauses · ${s.clips.length} clips` + (Monitor.seg ? ' · rec all' : '');
+    $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses`;
+  } else { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
+  $('stState').textContent = state;
+  $('stState').style.color = s && Monitor.clip ? css('--danger') : '';
+  $('stInfo').textContent = info;
   updateRecordAllInfo();
-  $('stFloor').textContent = Monitor.floor === null ? '–' : `${Monitor.floor.toFixed(0)} dB`;
-  if (!$('monitor').classList.contains('active') || !$('nightOverlay').hidden) return;
-  drawLive();
-};
-
-$('btnStart').onclick = async () => {
-  try {
-    await Monitor.start();
-  } catch (e) {
-    alert('Could not access the microphone: ' + e.message + '\n\nThe page must be opened over https (or localhost) and microphone permission must be allowed.');
-    return;
-  }
-  keepAwake();
-  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-  setRunningUI(true);
-  if (USE_NATIVE) checkBattery(true);
-};
+  if ($('nightOverlay').hidden && $('nightSheet').hidden) drawLive();
+}
+Monitor.onFrame = onLevelFrame;
+Preview.onFrame = onLevelFrame;
 
 function setRunningUI(on) {
-  $('btnStart').hidden = on; $('btnStop').hidden = !on; $('btnNight').disabled = !on;
-  if (!on) { $('stState').textContent = 'Stopped'; $('stState').style.color = ''; }
+  const b = $('btnToggle');
+  b.textContent = on ? 'Stop' : 'Start';
+  b.classList.toggle('running', on);
+  $('btnNight').disabled = !on;
 }
+
+$('btnToggle').onclick = async () => {
+  const b = $('btnToggle');
+  b.disabled = true;
+  try {
+    if (!Monitor.running) {
+      Preview.stop(); // free the microphone for the recorder
+      try {
+        await Monitor.start();
+      } catch (e) {
+        alert('Could not start monitoring: ' + e.message + (USE_NATIVE ? '' : '\n\nThe page must be opened over https and microphone access allowed.'));
+        startPreview();
+        return;
+      }
+      lastSaved = '';
+      keepAwake();
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+      setRunningUI(true);
+      if (USE_NATIVE) checkBattery(true);
+      renderWeek();
+    } else {
+      let s = null;
+      try { s = await Monitor.stop(); } catch (e) { alert('Stop failed: ' + e.message); }
+      setRunningUI(false);
+      allowSleep();
+      if (s) lastSaved = `Saved ${fmtDur(s.end - s.start)} · ${s.events.length} pauses · ${s.clips.length} clips`;
+      startPreview();
+      renderWeek();
+    }
+  } finally {
+    b.disabled = false;
+  }
+};
 
 // monitoring was stopped from the notification's Stop button
 function onStoppedElsewhere() {
   setRunningUI(false);
-  if ($('history').classList.contains('active')) renderHistory();
+  startPreview();
+  renderWeek();
 }
 
-$('btnStop').onclick = async () => {
-  $('btnStop').disabled = true;
-  let s = null;
-  try { s = await Monitor.stop(); } catch (e) { alert('Stop failed: ' + e.message); }
-  $('btnStop').disabled = false;
-  setRunningUI(false);
-  allowSleep();
-  if (s) alert(`Saved: ${fmtDur(s.end - s.start)}, ${s.clips.length} clips, ${s.events.length} breathing pauses.\nSee the History tab.`);
-};
-
 $('btnCalibrate').onclick = async () => {
-  const startedHere = !Monitor.running;
-  if (startedHere) {
-    try { await Monitor.start({ record: false }); } catch (e) { alert('Microphone error: ' + e.message); return; }
-    $('btnStart').disabled = true;
+  closeSheets();
+  if (!Monitor.running && !Preview.on) {
+    try { await Preview.start(); } catch (e) { alert('Microphone error: ' + e.message); return; }
   }
-  $('btnCalibrate').disabled = true; $('btnCalibrate').textContent = 'Stay quiet… measuring 10 s';
-  const t = await Monitor.calibrate(10);
-  if (startedHere) {
-    // discard the throw-away calibration session
-    const s = await Monitor.stop();
-    if (s) await Monitor.discard(s.id).catch(() => {});
-    $('stState').textContent = 'Idle';
-    $('btnStart').disabled = false;
-  }
-  $('btnCalibrate').disabled = false; $('btnCalibrate').textContent = 'Auto-set threshold (10 s quiet room)';
-  if (t !== null) {
-    settings.threshold = Math.min(100, Math.max(20, t)); saveSettings(); updateThresholdUI();
-    alert(`Threshold set to ${settings.threshold} dB (room level + 15 dB). Adjust with the slider if needed.`);
-  }
+  calib = [];
+  await new Promise((r) => setTimeout(r, 10000));
+  const vals = calib.sort((a, b) => a - b);
+  calib = null;
+  if (!vals.length) return;
+  settings.threshold = Math.min(100, Math.max(20, Math.round(vals[Math.floor(vals.length * 0.9)] + 15)));
+  saveSettings(); updateThresholdUI();
+  lastSaved = `Threshold set to ${settings.threshold} dB (room + 15)`;
 };
 
 function updateRecordAllInfo() {
   const el = $('recordAllInfo');
-  if (!FULL_OK) { el.textContent = 'Whole-night recording is not supported by this browser.'; return; }
-  if (!Monitor.running) { el.textContent = settings.recordAll ? 'Will record the whole night when you start.' : ''; return; }
+  if (!FULL_OK) { el.textContent = 'Not supported by this browser.'; return; }
+  if (!Monitor.running) { el.textContent = ''; return; }
   const bytes = Monitor.fullBytes();
-  el.textContent = Monitor.seg ? `● Recording the whole night${bytes ? ` · ${fmtMB(bytes)} so far` : ''}`
-    : (bytes ? `Whole-night recording paused · ${fmtMB(bytes)} saved` : '');
+  el.textContent = Monitor.seg ? `● Recording${bytes ? ` · ${fmtMB(bytes)} so far` : ''}`
+    : (bytes ? `Paused · ${fmtMB(bytes)} saved` : '');
 }
 $('recordAll').onchange = (e) => {
   settings.recordAll = e.target.checked; saveSettings();
@@ -665,11 +728,12 @@ $('recordAll').onchange = (e) => {
   updateRecordAllInfo();
 };
 
-$('thresholdQuick').oninput = (e) => { settings.threshold = +e.target.value; saveSettings(); updateThresholdUI(); };
+$('thresholdQuick').oninput = (e) => { settings.threshold = +e.target.value; saveSettings(); updateThresholdUI(); drawLive(); };
 
 // night mode: black screen, double-tap to exit
 let nightClockTimer;
 $('btnNight').onclick = () => {
+  closeSheets();
   $('nightOverlay').hidden = false;
   const tick = () => { $('nightClock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); };
   tick(); nightClockTimer = setInterval(tick, 10000);
@@ -685,16 +749,43 @@ $('nightOverlay').addEventListener('click', () => {
   lastTap = now;
 });
 
-// ---------------------------------------------------------------- tabs
-document.querySelectorAll('.tab').forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === b));
-    document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.id === b.dataset.tab));
-    if (b.dataset.tab === 'history') renderHistory();
-  };
+// ---------------------------------------------------------------- sheets (⋮ menu, night detail)
+// Opening a sheet adds a history entry, so the phone's Back button closes it.
+function openSheet(sh) {
+  if (!sh.hidden) return;
+  sh.hidden = false;
+  history.pushState({ sheet: sh.id }, '');
+}
+function hideSheet(sh) {
+  if (sh.hidden) return;
+  sh.hidden = true;
+  if (sh.id === 'nightSheet') { closeNight(); renderWeek(); }
+}
+function closeSheets() {
+  const open = [...document.querySelectorAll('.sheet')].filter((s) => !s.hidden);
+  if (open.length && history.state && history.state.sheet) history.back();
+  else open.forEach(hideSheet);
+}
+window.addEventListener('popstate', () => document.querySelectorAll('.sheet').forEach(hideSheet));
+document.querySelectorAll('.sheet').forEach((sh) => {
+  sh.addEventListener('click', (e) => { if (e.target === sh) closeSheets(); });
+  sh.querySelector('.sheet-close').onclick = closeSheets;
 });
+$('btnMenu').onclick = () => { openSheet($('menuSheet')); updateStorageInfo(); };
 
-// ---------------------------------------------------------------- settings UI
+async function updateStorageInfo() {
+  let text = '';
+  if (USE_NATIVE) {
+    const bytes = allNights.reduce((n, src) => n + (src.s.bytes || 0), 0);
+    text = `${fmtMB(bytes)} of recordings on this phone`;
+  } else if (navigator.storage && navigator.storage.estimate) {
+    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+    text = `${(usage / 1e6).toFixed(1)} MB used of ${(quota / 1e9).toFixed(1)} GB`;
+  }
+  $('storageInfo').textContent = text;
+}
+
+// ---------------------------------------------------------------- settings
 const FIELDS = {
   setThreshold: 'threshold', setPreRoll: 'preRoll', setPostRoll: 'postRoll', setMaxClip: 'maxClip',
   setApneaGap: 'apneaGap', setApneaMax: 'apneaMax', setBreathMargin: 'breathMargin', setMinBreaths: 'minBreaths',
@@ -767,142 +858,266 @@ function nativeSource(s) {
   return src;
 }
 
-async function renderHistory() {
-  openViews.forEach((v) => v.destroy());
-  openViews.clear();
-  const list = $('sessionList');
-  const sources = (await DB.getSessions()).map(idbSource);
-  let nativeBytes = 0;
-  if (USE_NATIVE) {
-    try {
-      const { sessions } = await SR.listSessions();
-      sessions.forEach((s) => { nativeBytes += s.bytes || 0; sources.push(nativeSource(s)); });
-    } catch (e) { console.error(e); }
-  }
-  sources.sort((a, b) => b.s.start - a.s.start);
-  list.innerHTML = '';
-  if (!sources.length) { list.innerHTML = '<p class="muted">No recordings yet. Start monitoring on the Monitor tab.</p>'; }
-  for (const src of sources) list.appendChild(renderSession(src));
-  if (USE_NATIVE) {
-    $('storageInfo').textContent = `${fmtMB(nativeBytes)} of recordings`;
-  } else if (navigator.storage && navigator.storage.estimate) {
-    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
-    $('storageInfo').textContent = `${(usage / 1e6).toFixed(1)} MB used of ${(quota / 1e9).toFixed(1)} GB`;
-  }
-}
-
 const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(Math.floor(sec % 60))}`;
 const segBytes = (s) => (s.segments || []).reduce((n, g) => n + (g.size || 0), 0);
 
-function renderSession(src) {
-  const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
+async function mountNight(el, src) {
   const live = src.live;
   let view = null;
-  const cur = () => (view ? view.s : src.s);
   const meta = () => {
-    const s = cur();
+    const s = view.s;
     const dur = (live ? Date.now() : s.end) - s.start;
     const full = (s.segments || []).length ? ` · full recording ${fmtMB(segBytes(s))}` : '';
     return `${fmtDur(dur)} · ${s.clips.length} clips · ${s.events.length} pauses · ${rate(s.events.length, dur)} pauses/h${full}`;
   };
-  el.querySelector('.s-date').textContent = fmtDate(src.s.start) + (live ? '  (recording now)' : '');
-  el.querySelector('.s-meta').textContent = meta();
+  let d;
+  try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return null; }
+  view = new NightView(el, d.s, d.clips, d.segs, src);
+  openViews.add(view);
 
-  el.addEventListener('toggle', async () => {
-    if (!el.open) { if (view) view.pause(); return; }
-    if (view) { view.draw(); return; }
-    let d;
-    try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return; }
-    view = new NightView(el, d.s, d.clips, d.segs, src);
-    openViews.add(view);
+  const renderSummary = () => {
+    const s = view.s;
+    const dur = (live ? Date.now() : s.end) - s.start;
+    const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
+    const loud = s.events.filter((e) => e.loudResume).length;
+    el.querySelector('.s-summary').innerHTML =
+      `<b>${s.events.length}</b> breathing pauses ≥ ${s.settings.apneaGap}s ` +
+      `(<b>${rate(s.events.length, dur)}</b>/hour)` +
+      (s.events.length ? ` · longest <b>${longest}s</b> · ${loud} ended with a loud gasp/snore` : '') +
+      (view.segs.length ? '<br>Whole night recorded: tap anywhere on the graph to listen.' : '') +
+      `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
+      `This app's count is only a rough sound-based estimate.</span>`;
+    el.querySelector('.s-meta').textContent = meta();
+    el.querySelector('.btn-dlfull').hidden = !view.segs.length;
+    el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
+  };
 
-    const renderSummary = () => {
-      const s = view.s;
-      const dur = (live ? Date.now() : s.end) - s.start;
-      const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
-      const loud = s.events.filter((e) => e.loudResume).length;
-      el.querySelector('.s-summary').innerHTML =
-        `<b>${s.events.length}</b> breathing pauses ≥ ${s.settings.apneaGap}s ` +
-        `(<b>${rate(s.events.length, dur)}</b>/hour)` +
-        (s.events.length ? ` · longest <b>${longest}s</b> · ${loud} ended with a loud gasp/snore` : '') +
-        (view.segs.length ? '<br>Whole night recorded: tap anywhere on the graph to listen.' : '') +
-        `<br><span class="muted">For reference, clinicians grade the apnea-hypopnea index as: &lt;5 normal, 5–15 mild, 15–30 moderate, 30+ severe. ` +
-        `This app's count is only a rough sound-based estimate.</span>`;
-      el.querySelector('.s-meta').textContent = meta();
-      el.querySelector('.btn-dlfull').hidden = !view.segs.length;
-      el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
-    };
+  // breathing pauses: tap to zoom the graph there and play the sound
+  const evBox = el.querySelector('.s-events');
+  const renderEvents = () => {
+    const s = view.s;
+    evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
+    s.events.forEach((e) => {
+      const d = document.createElement('div');
+      d.className = 'list-item clickable';
+      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
+        (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
+      d.onclick = () => view.focusEvent(e);
+      evBox.appendChild(d);
+    });
+  };
 
-    // breathing pauses: tap to zoom the graph there and play the sound
-    const evBox = el.querySelector('.s-events');
-    const renderEvents = () => {
-      const s = view.s;
-      evBox.innerHTML = s.events.length ? '' : '<p class="muted">None detected.</p>';
-      s.events.forEach((e) => {
-        const d = document.createElement('div');
-        d.className = 'list-item clickable';
-        d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s pause</b>` +
-          (e.loudResume ? '<span class="tag">loud resume</span>' : '') + '<span class="grow"></span><span class="muted">show ›</span>';
-        d.onclick = () => view.focusEvent(e);
-        evBox.appendChild(d);
-      });
-    };
+  // clips: tap a row to play it
+  const clipBox = el.querySelector('.s-clips');
+  const renderClips = () => {
+    const clips = view.clips;
+    clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
+    clips.forEach((c, i) => {
+      const d = document.createElement('div');
+      d.className = 'list-item clickable clip-row';
+      d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span>peak ${c.peak} dB</span>` +
+        (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
+        `<span class="grow"></span><button class="dl">Download</button><button class="rm danger">Delete</button>`;
+      d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
+      d.querySelector('.dl').onclick = () => src.save([{ item: c, name: `sleep_${fileStamp(c.start)}.wav` }]);
+      d.querySelector('.rm').onclick = async () => {
+        if (!confirm('Delete this clip?')) return;
+        await src.deleteClip(c);
+        view.removeClip(c);
+        renderClips(); renderSummary();
+      };
+      clipBox.appendChild(d);
+    });
+    view.rowMark = null;
+    view.markRows();
+  };
+  view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
+  view.onDataChanged();
 
-    // clips: tap a row to play it
-    const clipBox = el.querySelector('.s-clips');
-    const renderClips = () => {
-      const clips = view.clips;
-      clipBox.innerHTML = clips.length ? '' : '<p class="muted">No sounds above the threshold.</p>';
-      clips.forEach((c, i) => {
-        const d = document.createElement('div');
-        d.className = 'list-item clickable clip-row';
-        d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span>peak ${c.peak} dB</span>` +
-          (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
-          `<span class="grow"></span><button class="dl">Download</button><button class="rm danger">Delete</button>`;
-        d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
-        d.querySelector('.dl').onclick = () => src.save([{ item: c, name: `sleep_${fileStamp(c.start)}.wav` }]);
-        d.querySelector('.rm').onclick = async () => {
-          if (!confirm('Delete this clip?')) return;
-          await src.deleteClip(c);
-          view.removeClip(c);
-          renderClips(); renderSummary();
-        };
-        clipBox.appendChild(d);
-      });
-      view.rowMark = null;
-      view.markRows();
-    };
-    view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
-    view.onDataChanged();
+  el.querySelector('.btn-csv').onclick = () => {
+    const s = view.s;
+    const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
+    s.events.forEach((e) => rows.push(['pause', new Date(e.start).toISOString(), new Date(e.end).toISOString(), e.duration, '', e.loudResume ? 'loud resume' : '']));
+    view.clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
+    download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
+  };
+  el.querySelector('.btn-dlall').onclick = async () => {
+    if (view.clips.length) await src.save(view.clips.map((c) => ({ item: c, name: `sleep_${fileStamp(c.start)}.wav` })));
+  };
+  el.querySelector('.btn-dlfull').onclick = async () => {
+    if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Save them all?`)) return;
+    await src.save(view.segs.map((g) => ({ item: g, name: `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}` })));
+  };
+  el.querySelector('.btn-delfull').onclick = async () => {
+    if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(view.s))})? Saved clips and the graph are kept.`)) return;
+    await src.deleteFull();
+    view.clearSegments();
+    renderSummary();
+  };
+  el.querySelector('.btn-del').onclick = async () => {
+    if (live) { alert('Stop monitoring first.'); return; }
+    if (!confirm('Delete this whole night, including all clips and the full recording?')) return;
+    await src.deleteSession();
+    closeSheets();
+  };
+  return view;
+}
 
-    el.querySelector('.btn-csv').onclick = () => {
-      const s = view.s;
-      const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
-      s.events.forEach((e) => rows.push(['pause', new Date(e.start).toISOString(), new Date(e.end).toISOString(), e.duration, '', e.loudResume ? 'loud resume' : '']));
-      view.clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
-      download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
-    };
-    el.querySelector('.btn-dlall').onclick = async () => {
-      if (view.clips.length) await src.save(view.clips.map((c) => ({ item: c, name: `sleep_${fileStamp(c.start)}.wav` })));
-    };
-    el.querySelector('.btn-dlfull').onclick = async () => {
-      if (view.segs.length > 1 && !confirm(`The full recording is saved as ${view.segs.length} files of up to 10 minutes. Save them all?`)) return;
-      await src.save(view.segs.map((g) => ({ item: g, name: `sleep_full_${fileStamp(g.start)}.${extFor(g.mime)}` })));
-    };
-    el.querySelector('.btn-delfull').onclick = async () => {
-      if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(view.s))})? Saved clips and the graph are kept.`)) return;
-      await src.deleteFull();
-      view.clearSegments();
-      renderSummary();
-    };
-    el.querySelector('.btn-del').onclick = async () => {
-      if (live) { alert('Stop monitoring first.'); return; }
-      if (!confirm('Delete this whole night, including all clips and the full recording?')) return;
-      await src.deleteSession();
-      renderHistory();
-    };
+// ---------------------------------------------------------------- past nights: week grid
+let allNights = [];   // sources (see idbSource / nativeSource)
+let weekOffset = 0;   // 0 = this week, -1 = last week, ...
+let nightView = null;
+
+async function loadNights() {
+  const sources = (await DB.getSessions()).map(idbSource);
+  if (USE_NATIVE) {
+    try {
+      const { sessions } = await SR.listSessions();
+      sessions.forEach((s) => sources.push(nativeSource(s)));
+    } catch (e) { console.error(e); }
+  }
+  allNights = sources;
+}
+
+// a night belongs to the evening it started on (a start at 01:30 counts as the previous night)
+const nightDay = (t) => { const d = new Date(t - 12 * 3600e3); d.setHours(0, 0, 0, 0); return d.getTime(); };
+function weekStart(offset) {
+  const d = new Date(); d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + offset * 7); // Monday
+  return d;
+}
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const durShort = (ms) => { const m = Math.round(ms / 60000); return m >= 60 ? `${Math.floor(m / 60)}h${pad(m % 60)}` : `${m}m`; };
+const nightEnd = (src) => (src.live ? Date.now() : src.s.end);
+const rateClass = (r) => (r < 5 ? 'r1' : r < 15 ? 'r2' : r < 30 ? 'r3' : 'r4');
+
+function sparkOf(s) {
+  if (s.spark) return s.spark;
+  const lv = s.levels || [], n = Math.min(60, lv.length), out = [];
+  for (let b = 0; b < n; b++) {
+    let m = 0;
+    for (let i = Math.floor((b * lv.length) / n); i < Math.max(Math.floor(((b + 1) * lv.length) / n), Math.floor((b * lv.length) / n) + 1); i++) m = Math.max(m, lv[i]);
+    out.push(m);
+  }
+  return out;
+}
+
+function drawSpark(cv, src) {
+  const { g, w, h } = setupCanvas(cv);
+  const s = src.s, data = sparkOf(s), total = Math.max(1, nightEnd(src) - s.start);
+  if (data.length) {
+    const bw = w / data.length;
+    g.fillStyle = css('--accent');
+    data.forEach((v, i) => {
+      const y = yOf(v, h);
+      g.fillRect(i * bw, y, Math.max(1, bw - 0.5), h - y);
+    });
+  }
+  // breathing pauses: short ticks along the top
+  g.fillStyle = css('--warn');
+  (s.events || []).forEach((e) => g.fillRect(((e.start - s.start) / total) * w, 0, 1, Math.max(3, h * 0.18)));
+}
+
+async function renderWeek(reload = true) {
+  if (reload) await loadNights();
+  const ws = weekStart(weekOffset), we = addDays(ws, 7);
+  const fmtD = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  $('weekLabel').textContent = weekOffset === 0 ? `This week · ${fmtD(ws)} – ${fmtD(addDays(ws, 6))}`
+    : weekOffset === -1 ? `Last week · ${fmtD(ws)} – ${fmtD(addDays(ws, 6))}` : `${fmtD(ws)} – ${fmtD(addDays(ws, 6))}`;
+  $('weekNext').disabled = weekOffset >= 0;
+  $('weekPrev').disabled = !allNights.some((n) => nightDay(n.s.start) < ws.getTime());
+
+  const grid = $('weekGrid');
+  grid.innerHTML = '';
+  const today = nightDay(Date.now() + 12 * 3600e3), inWeek = [];
+  const sparks = [];
+  for (let i = 0; i < 7; i++) {
+    const day = addDays(ws, i).getTime();
+    const list = allNights.filter((n) => nightDay(n.s.start) === day).sort((a, b) => a.s.start - b.s.start);
+    inWeek.push(...list);
+    const main = list.reduce((best, n) => (!best || nightEnd(n) - n.s.start > nightEnd(best) - best.s.start ? n : best), null);
+    const el = document.createElement(main ? 'button' : 'div');
+    el.className = 'tile' + (main ? ' has' : ' empty') + (day === today ? ' today' : '');
+    const label = new Date(day).toLocaleDateString([], { weekday: 'short', day: 'numeric' });
+    let html = `<div class="t-day"><span>${label}</span>` +
+      (list.some((n) => n.live) ? '<span class="badge">REC</span>' : list.length > 1 ? `<span class="more">+${list.length - 1}</span>` : '') + '</div>';
+    if (main) {
+      const dur = nightEnd(main) - main.s.start, n = main.s.events.length;
+      const r = dur >= 600000 ? n / (dur / 3600e3) : null;
+      html += `<div class="t-time">${hm(main.s.start)}</div><canvas></canvas>` +
+        `<div class="t-time">${durShort(dur)}</div>` +
+        `<div class="t-rate ${r === null ? '' : rateClass(r)}">${r === null ? '–' : `${r.toFixed(1)}/h`}</div>`;
+      el.onclick = () => openNight(list, list.indexOf(main));
+    } else {
+      html += `<div class="t-time">${day > today ? '' : '—'}</div>`;
+    }
+    el.innerHTML = html;
+    grid.appendChild(el);
+    if (main) sparks.push([el.querySelector('canvas'), main]);
+  }
+
+  // 8th tile: week summary
+  const sum = document.createElement('div');
+  sum.className = 'tile summary';
+  const hours = inWeek.reduce((t, n) => t + (nightEnd(n) - n.s.start), 0) / 3600e3;
+  const pauses = inWeek.reduce((t, n) => t + n.s.events.length, 0);
+  const nights = new Set(inWeek.map((n) => nightDay(n.s.start))).size;
+  const avg = hours >= 1 / 6 ? pauses / hours : null;
+  sum.innerHTML = `<div class="t-day"><span>Week</span></div>` +
+    `<div><b>${nights}</b> night${nights === 1 ? '' : 's'}</div>` +
+    `<div class="muted">${hours ? `${(hours / Math.max(1, nights)).toFixed(1)} h avg` : '—'}</div>` +
+    `<div class="t-time">pauses/h</div>` +
+    `<div class="t-rate ${avg === null ? '' : rateClass(avg)}"><b>${avg === null ? '–' : avg.toFixed(1)}</b></div>`;
+  grid.appendChild(sum);
+  requestAnimationFrame(() => sparks.forEach(([cv, src]) => drawSpark(cv, src)));
+}
+
+$('weekPrev').onclick = () => { weekOffset--; renderWeek(false); };
+$('weekNext').onclick = () => { if (weekOffset < 0) { weekOffset++; renderWeek(false); } };
+// swipe the grid sideways to change week
+(() => {
+  let x0 = null;
+  const g = $('weekGrid');
+  g.addEventListener('pointerdown', (e) => { x0 = e.clientX; });
+  g.addEventListener('pointerup', (e) => {
+    if (x0 === null) return;
+    const dx = e.clientX - x0; x0 = null;
+    if (Math.abs(dx) < 60) return;
+    if (dx > 0 && !$('weekPrev').disabled) $('weekPrev').click();
+    if (dx < 0 && !$('weekNext').disabled) $('weekNext').click();
   });
-  return el;
+})();
+window.addEventListener('resize', () => renderWeek(false));
+
+// ---------------------------------------------------------------- one night (full screen)
+function closeNight() {
+  if (nightView) { nightView.destroy(); openViews.delete(nightView); nightView = null; }
+  $('nightBody').innerHTML = '';
+  $('nightPick').innerHTML = '';
+}
+
+function openNight(list, idx) {
+  openSheet($('nightSheet'));
+  const show = async (i) => {
+    closeNight();
+    const src = list[i];
+    $('nightTitle').textContent = fmtDate(src.s.start) + (src.live ? ' · recording' : '');
+    if (list.length > 1) {
+      list.forEach((n, j) => {
+        const b = document.createElement('button');
+        b.textContent = `${hm(n.s.start)} · ${durShort(nightEnd(n) - n.s.start)}`;
+        b.className = j === i ? 'on' : '';
+        b.onclick = () => show(j);
+        $('nightPick').appendChild(b);
+      });
+    }
+    const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
+    $('nightBody').appendChild(el);
+    $('nightBody').scrollTop = 0;
+    nightView = await mountNight(el, src);
+  };
+  show(idx);
 }
 
 /*
@@ -948,14 +1163,14 @@ class NightView {
     this.audio.addEventListener('timeupdate', () => this.updatePlayer());
 
     this.bindPointer();
-    this.onResize = () => { if (root.open) this.draw(); };
+    this.onResize = () => { if (root.isConnected) this.draw(); };
     window.addEventListener('resize', this.onResize);
     this.counts = this.countKey();
     if (this.live) {
       // night still being recorded: pick up new clips/files/pauses and keep the graph growing
       this.lastEnd = this.v1;
       this.liveTimer = setInterval(() => {
-        if (!root.open || document.visibilityState !== 'visible') return;
+        if (!root.isConnected || document.visibilityState !== 'visible') return;
         const end = this.tEnd(), sp = this.v1 - this.v0, atEnd = this.v1 >= this.lastEnd - 1000;
         this.lastEnd = end;
         if (atEnd) { this.v1 = end; if (this.v0 !== this.t0) this.v0 = end - sp; }
@@ -1393,21 +1608,35 @@ async function checkBattery(prompt) {
     }
   } catch {}
 }
-if (USE_NATIVE) {
-  $('bgHint').hidden = false;
-  $('webHint').hidden = true;
-  $('btnBattery').onclick = () => SR.openBatterySettings();
-  const reattach = async () => { if (await NativeMonitor.resume().catch(() => false)) setRunningUI(true); else if (!$('btnStop').hidden) setRunningUI(false); };
-  reattach();
-  checkBattery(false);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') { reattach(); checkBattery(false); }
-  });
+if (USE_NATIVE) $('btnBattery').onclick = () => SR.openBatterySettings();
+
+// show what's happening: reattach to a running background recorder, otherwise show the live preview
+async function refreshState() {
+  if (USE_NATIVE) {
+    const running = await NativeMonitor.resume().catch(() => false);
+    setRunningUI(running);
+    checkBattery(false);
+  }
+  if (!Monitor.running) startPreview();
 }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    refreshState();
+    if (Monitor.running) keepAwake();
+    renderWeek();
+  } else {
+    Preview.stop(); // don't hold the microphone in the background just for the meter
+  }
+});
+// keep today's tile up to date during the night
+setInterval(() => { if (Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden) renderWeek(); }, 60000);
 
 // ---------------------------------------------------------------- boot
 fillSettings();
+setRunningUI(false);
 drawLive();
+renderWeek();
+refreshState();
 window.addEventListener('beforeunload', (e) => { if (Monitor.running && !USE_NATIVE) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
 if ('serviceWorker' in navigator && location.protocol !== 'file:' && !NATIVE) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

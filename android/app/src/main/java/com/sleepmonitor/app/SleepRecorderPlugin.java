@@ -146,8 +146,9 @@ public class SleepRecorderPlugin extends Plugin {
                 if (!d.isDirectory()) continue;
                 try {
                     SleepService live = liveService(d.getName());
-                    JSONObject s = live != null ? live.snapshot(false) : readSession(d);
+                    JSONObject s = live != null ? live.snapshot(true) : readSession(d);
                     if (s == null) continue;
+                    s.put("spark", spark(s.optJSONArray("levels"), 60)); // small graph for the week grid
                     s.remove("levels");
                     s.put("live", live != null);
                     s.put("bytes", dirSize(d));
@@ -326,6 +327,20 @@ public class SleepRecorderPlugin extends Plugin {
             JSONObject o = arr.getJSONObject(i);
             o.put("path", new File(d, o.optString("file")).getAbsolutePath());
         }
+    }
+
+    /** Downsamples the per-second levels to at most n points (max of each bucket). */
+    private static JSONArray spark(JSONArray lv, int n) {
+        JSONArray out = new JSONArray();
+        if (lv == null || lv.length() == 0) return out;
+        int len = lv.length(), buckets = Math.min(n, len);
+        for (int b = 0; b < buckets; b++) {
+            int from = (int) ((long) b * len / buckets), to = Math.max(from + 1, (int) ((long) (b + 1) * len / buckets));
+            double m = 0;
+            for (int i = from; i < to && i < len; i++) m = Math.max(m, lv.optDouble(i, 0));
+            out.put(Math.round(m));
+        }
+        return out;
     }
 
     private static long dirSize(File d) {

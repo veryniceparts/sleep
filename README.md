@@ -44,9 +44,18 @@ Then use **Add to Home Screen** (iOS Safari) or **Install app** (Android Chrome)
 5. **Android app:** lock the phone or use other apps as you like. **Web version:** leave the page open. The screen is kept awake so the browser keeps recording. Don't switch apps or lock the phone, because mobile browsers stop the microphone in the background.
 6. In the morning, tap **Stop** and open **History**.
 
+## The screen
+
+Everything fits on one screen:
+
+- **Live card:** the dB level and live graph work as soon as the app opens. **Start** turns into **Stop** while monitoring. The red line is the recording threshold, which you can adjust with the slider.
+- **Past nights:** a 4×2 grid for one week, with Monday–Sunday plus a week summary (nights, average hours, pauses per hour). Each tile shows the start time, length, a small graph and pauses per hour, colored green/yellow/orange/red by the clinical grading bands. Switch weeks with ‹ › or by swiping the grid. **+1** means more than one recording that night. A night that starts after midnight counts as the previous evening.
+- **⋮ menu:** record the whole night, auto-set threshold, night mode, battery settings (Android) and all detection settings.
+
 ## Checking a night: graph and replay
 
-Open **History** and tap a night.
+Tap a day in the grid to open that night full screen. The phone's Back button or ‹ returns to the grid.
+
 
 - **Graph:** the blue area is sound level, the red dashed line is your threshold, orange bands are breathing pauses and yellow marks along the bottom are saved clips.
 - **Green strip along the top:** parts of the night covered by the whole-night recording.

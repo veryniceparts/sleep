@@ -13,103 +13,104 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header>
-    <h1>Sleep Monitor</h1>
-    <nav>
-      <button class="tab active" data-tab="monitor">Monitor</button>
-      <button class="tab" data-tab="history">History</button>
-      <button class="tab" data-tab="settings">Settings</button>
-    </nav>
-  </header>
+  <div id="app">
+    <header class="topbar">
+      <h1>Sleep Monitor</h1>
+      <button id="btnMenu" class="icon-btn" aria-label="Settings">⋮</button>
+    </header>
 
-  <main>
-    <!-- MONITOR -->
-    <section id="monitor" class="panel active">
-      <div class="meter-wrap">
-        <div class="level-readout"><span id="levelNow">--</span><small> dB</small></div>
-        <div class="meter">
-          <div id="meterBar" class="meter-bar"></div>
-          <div id="meterFloor" class="meter-mark floor" title="Noise floor"></div>
-          <div id="meterThreshold" class="meter-mark threshold" title="Recording threshold"></div>
+    <!-- live monitor: level, graph and Start/Stop in one card -->
+    <section class="monitor-card" id="monitorCard">
+      <div class="mc-top">
+        <div class="level-readout"><span id="levelNow">--</span><small>dB</small></div>
+        <div class="mc-state">
+          <span id="stState">Starting microphone…</span>
+          <span id="stInfo" class="muted"></span>
         </div>
-        <canvas id="liveChart" height="120"></canvas>
       </div>
-
-      <label class="slider">
-        <span>Recording threshold: <b id="thresholdVal">60</b> dB</span>
+      <div class="meter">
+        <div id="meterBar" class="meter-bar"></div>
+        <div id="meterFloor" class="meter-mark floor" title="Breath level"></div>
+        <div id="meterThreshold" class="meter-mark threshold" title="Recording threshold"></div>
+      </div>
+      <canvas id="liveChart"></canvas>
+      <label class="thr-row">
+        <span>Threshold <b id="thresholdVal">60</b> dB</span>
         <input id="thresholdQuick" type="range" min="20" max="100" step="1" value="60">
       </label>
-
-      <div class="status-grid">
-        <div><span class="k">Status</span><span id="stState" class="v">Idle</span></div>
-        <div><span class="k">Elapsed</span><span id="stElapsed" class="v">0:00:00</span></div>
-        <div><span class="k">Saved clips</span><span id="stClips" class="v">0</span></div>
-        <div><span class="k">Breathing pauses</span><span id="stEvents" class="v">0</span></div>
-        <div><span class="k">Pauses / hour</span><span id="stRate" class="v">–</span></div>
-        <div><span class="k">Noise floor</span><span id="stFloor" class="v">–</span></div>
-      </div>
-
-      <label class="field check record-all"><input type="checkbox" id="recordAll">
-        <span><b>Record the whole night</b> (about 15 MB per hour) so you can replay any moment, not only the loud ones</span></label>
-      <div id="recordAllInfo" class="muted"></div>
-
-      <div class="actions">
-        <button id="btnStart" class="primary big">Start monitoring</button>
-        <button id="btnStop" class="danger big" hidden>Stop</button>
-      </div>
-      <div class="actions">
-        <button id="btnCalibrate">Auto-set threshold (10 s quiet room)</button>
-        <button id="btnNight" disabled>Night mode (dark screen)</button>
-      </div>
-
-      <p class="hint" id="webHint">Put the phone 0.5–1 m from your head, plugged into a charger, and keep this page open.
-        The screen stays awake while monitoring. Night mode turns the screen black but keeps recording.</p>
-      <p class="hint" id="bgHint" hidden>Put the phone 0.5–1 m from your head, ideally on a charger.
-        <b>You can lock the screen or switch to other apps.</b> Monitoring keeps running in the background, shown by the
-        “Monitoring your sleep” notification. Stop it here or from the notification.</p>
-      <div class="actions"><button id="btnBattery" hidden>Allow running without battery restrictions</button></div>
-      <p class="disclaimer">⚠️ This is not a medical device and cannot diagnose sleep apnea. Use the recordings to
-        talk to a doctor; a sleep study is the only reliable diagnosis.</p>
+      <button id="btnToggle" class="toggle">Start</button>
     </section>
 
-    <!-- HISTORY -->
-    <section id="history" class="panel">
-      <div class="row between">
-        <h2>Nights</h2>
-        <span id="storageInfo" class="muted"></span>
+    <!-- past nights: 4x2 grid per week -->
+    <section class="nights">
+      <div class="week-nav">
+        <button id="weekPrev" class="icon-btn" aria-label="Previous week">‹</button>
+        <span id="weekLabel"></span>
+        <button id="weekNext" class="icon-btn" aria-label="Next week">›</button>
       </div>
-      <div id="sessionList"></div>
+      <div id="weekGrid" class="week-grid"></div>
     </section>
+  </div>
 
-    <!-- SETTINGS -->
-    <section id="settings" class="panel">
-      <h2>Recording</h2>
-      <label class="field"><span>Threshold (dB): sounds louder than this are saved</span>
-        <input type="number" id="setThreshold" min="20" max="100" step="1"></label>
-      <label class="field"><span>Pre-roll (s): audio kept from before the sound started</span>
-        <input type="number" id="setPreRoll" min="0" max="15" step="1"></label>
-      <label class="field"><span>Stop after quiet for (s)</span>
-        <input type="number" id="setPostRoll" min="1" max="30" step="1"></label>
-      <label class="field"><span>Max clip length (s)</span>
-        <input type="number" id="setMaxClip" min="5" max="300" step="5"></label>
+  <!-- settings (⋮) -->
+  <div id="menuSheet" class="sheet" hidden>
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <h2>Settings</h2>
+        <button class="icon-btn sheet-close" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-body">
+        <label class="field check"><input type="checkbox" id="recordAll">
+          <span><b>Record the whole night</b> (about 15 MB per hour) to replay any moment</span></label>
+        <div id="recordAllInfo" class="muted"></div>
+        <div class="actions">
+          <button id="btnCalibrate">Auto-set threshold</button>
+          <button id="btnNight">Night mode</button>
+          <button id="btnBattery" hidden>Allow background running</button>
+        </div>
 
-      <h2>Breathing-pause (apnea) detection</h2>
-      <label class="field"><span>Minimum pause length (s). Clinical apnea is ≥ 10 s</span>
-        <input type="number" id="setApneaGap" min="5" max="60" step="1"></label>
-      <label class="field"><span>Ignore pauses longer than (s). These are probably not breathing pauses</span>
-        <input type="number" id="setApneaMax" min="20" max="300" step="5"></label>
-      <label class="field"><span>Breath sensitivity: dB above the noise floor that counts as a breath/snore</span>
-        <input type="number" id="setBreathMargin" min="2" max="30" step="1"></label>
-      <label class="field"><span>Breaths needed in the 60 s before a pause</span>
-        <input type="number" id="setMinBreaths" min="1" max="20" step="1"></label>
-      <label class="field check"><input type="checkbox" id="setClipPauses">
-        <span>Always save a clip when breathing restarts after a pause, even if it is quiet</span></label>
+        <h3>Recording</h3>
+        <label class="field row-field"><span>Threshold (dB)</span>
+          <input type="number" id="setThreshold" min="20" max="100" step="1"></label>
+        <label class="field row-field"><span>Pre-roll (s)</span>
+          <input type="number" id="setPreRoll" min="0" max="15" step="1"></label>
+        <label class="field row-field"><span>Stop after quiet for (s)</span>
+          <input type="number" id="setPostRoll" min="1" max="30" step="1"></label>
+        <label class="field row-field"><span>Max clip length (s)</span>
+          <input type="number" id="setMaxClip" min="5" max="300" step="5"></label>
 
-      <div class="actions"><button id="btnResetSettings">Reset to defaults</button></div>
-      <p class="muted">Levels are relative (0 dB = digital silence, ~100 dB = maximum). They are not calibrated
-        sound-pressure levels and differ between phones.</p>
-    </section>
-  </main>
+        <h3>Breathing pauses</h3>
+        <label class="field row-field"><span>Minimum pause (s)</span>
+          <input type="number" id="setApneaGap" min="5" max="60" step="1"></label>
+        <label class="field row-field"><span>Ignore pauses longer than (s)</span>
+          <input type="number" id="setApneaMax" min="20" max="300" step="5"></label>
+        <label class="field row-field"><span>Breath sensitivity (dB above floor)</span>
+          <input type="number" id="setBreathMargin" min="2" max="30" step="1"></label>
+        <label class="field row-field"><span>Breaths needed before a pause</span>
+          <input type="number" id="setMinBreaths" min="1" max="20" step="1"></label>
+        <label class="field check"><input type="checkbox" id="setClipPauses">
+          <span>Save a clip when breathing restarts after a pause</span></label>
+
+        <div class="actions"><button id="btnResetSettings">Reset to defaults</button></div>
+        <p class="muted small" id="storageInfo"></p>
+        <p class="muted small">Levels are relative (0 = silence, ~100 = maximum) and differ between phones.</p>
+        <p class="disclaimer">⚠️ Not a medical device and can't diagnose sleep apnea. A sleep study is the only reliable diagnosis.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- one night, opened from the grid -->
+  <div id="nightSheet" class="sheet full" hidden>
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <button class="icon-btn sheet-close" aria-label="Back">‹</button>
+        <h2 id="nightTitle"></h2>
+        <span></span>
+      </div>
+      <div id="nightPick" class="night-pick"></div>
+      <div class="sheet-body" id="nightBody"></div>
+    </div>
+  </div>
 
   <div id="nightOverlay" hidden>
     <div class="night-text">
@@ -120,53 +121,46 @@
   </div>
 
   <template id="sessionTpl">
-    <details class="session">
-      <summary>
-        <span class="s-date"></span>
-        <span class="s-meta muted"></span>
-      </summary>
-      <div class="s-body">
-        <div class="chart-tools">
-          <button class="z-out" aria-label="Zoom out">−</button>
-          <button class="z-in" aria-label="Zoom in">+</button>
-          <button class="z-all">Whole night</button>
-          <span class="z-label muted"></span>
-        </div>
-        <div class="chart-box">
-          <canvas class="s-chart" height="220"></canvas>
-          <div class="s-tip" hidden></div>
-        </div>
-        <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
-          <span class="lg evt"></span>breathing pause <span class="lg clp"></span>saved clip
-          <span class="lg full"></span>whole-night recording</div>
-        <p class="muted">Tap the graph to play the sound at that moment. Drag sideways to scroll. Pinch, use the mouse wheel or +/− to zoom.</p>
+    <div class="session">
+      <div class="s-meta muted"></div>
+      <div class="chart-tools">
+        <button class="z-out" aria-label="Zoom out">−</button>
+        <button class="z-in" aria-label="Zoom in">+</button>
+        <button class="z-all">All</button>
+        <span class="z-label muted"></span>
+      </div>
+      <div class="chart-box">
+        <canvas class="s-chart" height="200"></canvas>
+        <div class="s-tip" hidden></div>
+      </div>
+      <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
+        <span class="lg evt"></span>pause <span class="lg clp"></span>clip <span class="lg full"></span>full recording</div>
 
-        <div class="player">
-          <button class="p-prev" aria-label="Previous clip">⏮</button>
-          <button class="p-play primary" aria-label="Play">▶</button>
-          <button class="p-next" aria-label="Next clip">⏭</button>
-          <div class="p-info">
-            <div class="p-title">Tap the graph or a clip to play</div>
-            <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
-              <span class="p-time muted">0:00</span></div>
-          </div>
-        </div>
-        <label class="field check p-allwrap"><input type="checkbox" class="p-all">
-          <span>Play all clips one after another (replay the night)</span></label>
-        <div class="s-summary"></div>
-        <h3>Breathing pauses</h3>
-        <div class="s-events"></div>
-        <h3>Saved clips</h3>
-        <div class="s-clips"></div>
-        <div class="actions">
-          <button class="btn-csv">Export CSV</button>
-          <button class="btn-dlall">Download all clips</button>
-          <button class="btn-dlfull" hidden>Download full recording</button>
-          <button class="btn-delfull danger" hidden>Delete full recording</button>
-          <button class="btn-del danger">Delete night</button>
+      <div class="player">
+        <button class="p-prev" aria-label="Previous">⏮</button>
+        <button class="p-play primary" aria-label="Play">▶</button>
+        <button class="p-next" aria-label="Next">⏭</button>
+        <div class="p-info">
+          <div class="p-title">Tap the graph to play</div>
+          <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
+            <span class="p-time muted">0:00</span></div>
         </div>
       </div>
-    </details>
+      <label class="field check p-allwrap"><input type="checkbox" class="p-all">
+        <span>Play all clips one after another</span></label>
+      <div class="s-summary"></div>
+      <h3>Breathing pauses</h3>
+      <div class="s-events"></div>
+      <h3>Saved clips</h3>
+      <div class="s-clips"></div>
+      <div class="actions">
+        <button class="btn-csv">Export CSV</button>
+        <button class="btn-dlall">Download clips</button>
+        <button class="btn-dlfull" hidden>Download full recording</button>
+        <button class="btn-delfull danger" hidden>Delete full recording</button>
+        <button class="btn-del danger">Delete night</button>
+      </div>
+    </div>
   </template>
 
   <script src="app.js"></script>
