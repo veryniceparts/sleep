@@ -235,6 +235,24 @@ public class SleepRecorderPlugin extends Plugin {
         }
     }
 
+    /** Stores the sound-recognition result of a finished night in its session.json. */
+    @PluginMethod
+    public void saveAnalysis(PluginCall call) {
+        String id = call.getString("sessionId");
+        JSObject analysis = call.getObject("analysis");
+        if (liveService(id) != null) { call.reject("Night is still being recorded"); return; }
+        File d = sessionDir(id);
+        try {
+            JSONObject s = d == null ? null : readSession(d);
+            if (s == null || analysis == null) { call.reject("not found"); return; }
+            s.put("analysis", new JSONObject(analysis.toString()));
+            writeSession(d, s);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject(e.getMessage());
+        }
+    }
+
     /** Opens Android's share sheet for recordings (save to Files/Drive, send by email, ...). */
     @PluginMethod
     public void share(PluginCall call) {

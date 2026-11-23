@@ -33,9 +33,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Download the sound-recognition model (YAMNet)
+        run: npm run fetch-model
+
       - name: Copy web app into the Android project
         run: |
           npm run build:web
+          test -f www/vendor/yamnet.tflite
           npx cap sync android
 
       - name: Build APK

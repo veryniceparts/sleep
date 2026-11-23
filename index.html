@@ -60,8 +60,7 @@
         <button class="icon-btn sheet-close" aria-label="Close">✕</button>
       </div>
       <div class="sheet-body">
-        <label class="field check"><input type="checkbox" id="recordAll">
-          <span><b>Record the whole night</b> (about 15 MB per hour) to replay any moment</span></label>
+        <input type="checkbox" id="recordAll" hidden>
         <div id="recordAllInfo" class="muted"></div>
         <div class="actions">
           <button id="btnCalibrate">Auto-set threshold</button>
@@ -127,14 +126,17 @@
         <button class="z-out" aria-label="Zoom out">−</button>
         <button class="z-in" aria-label="Zoom in">+</button>
         <button class="z-all">All</button>
-        <span class="z-label muted"></span>
+        <label class="thr-night" title="Sounds louder than this count as loud sounds for this night">
+          <span>Loud ≥ <b class="thr-v">60</b></span>
+          <input type="range" class="thr-in" min="30" max="95" step="1">
+        </label>
       </div>
       <div class="chart-box">
         <canvas class="s-chart"></canvas>
         <div class="s-tip" hidden></div>
       </div>
       <div class="legend muted"><span class="lg lvl"></span>level <span class="lg thr"></span>threshold
-        <span class="lg evt"></span>pause <span class="lg clp"></span>clip <span class="lg full"></span>full rec.</div>
+        <span class="lg evt"></span>pause <span class="lg snd"></span>loud sound <span class="lg cats"></span>recognised (top band)</div>
 
       <div class="player">
         <button class="p-prev" aria-label="Previous">⏮</button>
@@ -145,6 +147,7 @@
           <div class="p-bar"><input type="range" class="p-seek" min="0" max="1000" value="0">
             <span class="p-time muted">0:00</span></div>
         </div>
+        <button class="p-boost" title="Amplify playback">×1</button>
       </div>
 
       <div class="s-lists">
@@ -153,8 +156,9 @@
           <div class="s-list-body s-events"></div>
         </section>
         <section class="s-panel">
-          <div class="s-panel-head">Clips <span class="n-cl"></span></div>
-          <div class="s-list-body s-clips"></div>
+          <div class="s-panel-head">Sounds <span class="n-cl"></span> <span class="an-status"></span></div>
+          <div class="cat-chips"></div>
+          <div class="s-list-body s-sounds"></div>
         </section>
       </div>
 

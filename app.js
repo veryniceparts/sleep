@@ -20,7 +20,7 @@ const DEFAULTS = {
   breathMargin: 6,   // dB above noise floor that counts as a breath
   minBreaths: 3,     // breath sounds required in 60 s before a pause
   clipPauses: true,  // save a clip when breathing restarts after a pause
-  recordAll: false,  // also record the whole night (compressed)
+  recordAll: true,   // record the whole night (compressed)
 };
 const CLIP_RATE = 16000;     // saved audio sample rate (Hz)
 const LIVE_SECONDS = 60;     // live chart window
@@ -45,8 +45,11 @@ const FULL_OK = USE_NATIVE || FULL_MIME !== null; // whole-night recording avail
 
 let settings = loadSettings();
 function loadSettings() {
-  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sleepmon.settings') || '{}') }; }
-  catch { return { ...DEFAULTS }; }
+  let st;
+  try { st = { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sleepmon.settings') || '{}') }; }
+  catch { st = { ...DEFAULTS }; }
+  st.recordAll = true; // the whole night is always recorded (needed for replay and sound recognition)
+  return st;
 }
 function saveSettings() {
   try { localStorage.setItem('sleepmon.settings', JSON.stringify(settings)); } catch {}
@@ -528,7 +531,7 @@ const download = (blob, name) => downloadMany([{ blob, name }]);
 function setupCanvas(cv) {
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth || 300, h = cv.clientHeight || +cv.getAttribute('height');
-  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
@@ -698,7 +701,7 @@ function onLevelFrame() {
   else if (s) {
     state = Monitor.clip ? '● Recording sound' : Monitor.silence ? 'Quiet' : 'Monitoring';
     const el = Date.now() - s.start;
-    info = `${fmtDur(el)} · ${s.events.length} pauses · ${s.clips.length} clips` + (Monitor.seg ? ' · rec all' : '');
+    info = `${fmtDur(el)} · ${s.events.length} pauses · ${s.clips.length} clips` ;
     $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses`;
   } else { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
   $('stState').textContent = state;
@@ -864,7 +867,7 @@ for (const [id, key] of Object.entries(FIELDS)) {
   });
 }
 $('setClipPauses').onchange = (e) => { settings.clipPauses = e.target.checked; saveSettings(); };
-$('btnResetSettings').onclick = () => { settings = { ...DEFAULTS }; saveSettings(); Monitor.setRecordAll(settings.recordAll); fillSettings(); };
+$('btnResetSettings').onclick = () => { settings = { ...DEFAULTS, recordAll: true }; saveSettings(); Monitor.setRecordAll(settings.recordAll); fillSettings(); };
 
 // ---------------------------------------------------------------- history UI
 const openViews = new Set();
@@ -893,6 +896,7 @@ function idbSource(s) {
     },
     async deleteFull() { await DB.deleteSegments(s.id); s.segments = []; await DB.putSession(s); },
     deleteSession: () => DB.deleteSession(s.id),
+    async saveAnalysis(a) { s.analysis = a; if (!live) await DB.putSession(s); },
     save: (items) => downloadMany(items.map((i) => ({ blob: i.item.blob, name: i.name }))),
   };
 }
@@ -909,12 +913,15 @@ function nativeSource(s) {
     },
     async deleteClip(c) { await SR.deleteClip({ sessionId: s.id, clipId: c.id }); src.s.clips = src.s.clips.filter((x) => x.id !== c.id); },
     async deleteFull() { await SR.deleteFull({ sessionId: s.id }); src.s.segments = []; },
+    async saveAnalysis(a) { await SR.saveAnalysis({ sessionId: s.id, analysis: a }); src.s.analysis = a; },
     deleteSession: () => SR.deleteSession({ id: s.id }),
     save: (items) => SR.share({ files: items.map((i) => ({ path: i.item.path, name: i.name })) }).catch((e) => alert(e.message)),
   };
   return src;
 }
 
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, String(v)); } catch {} };
 const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(Math.floor(sec % 60))}`;
 const segBytes = (s) => (s.segments || []).reduce((n, g) => n + (g.size || 0), 0);
 
@@ -936,7 +943,7 @@ async function mountNight(el, src) {
   const renderSummary = () => {
     el.querySelector('.s-meta').textContent = meta();
     el.querySelector('.n-ev').textContent = view.s.events.length;
-    el.querySelector('.n-cl').textContent = view.clips.length;
+    el.querySelector('.n-cl').textContent = view.soundList().length;
     el.querySelector('.btn-dlfull').hidden = !view.segs.length;
     el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
   };
@@ -956,32 +963,73 @@ async function mountNight(el, src) {
     });
   };
 
-  // clips: tap a row to play it
-  const clipBox = el.querySelector('.s-clips');
-  const renderClips = () => {
-    const clips = view.clips;
-    clipBox.innerHTML = clips.length ? '' : '<p class="muted empty">No sounds above the threshold.</p>';
-    clips.forEach((c, i) => {
+  // sounds above this night's threshold, labelled by what they are; tap to play
+  const sndBox = el.querySelector('.s-sounds'), chipBox = el.querySelector('.cat-chips');
+  const renderSounds = () => {
+    const list = view.soundList();
+    sndBox.innerHTML = list.length ? '' : `<p class="muted empty">No ${view.cat ? CATS[view.cat].name.toLowerCase() + ' ' : ''}sounds above ${view.thr} dB.</p>`;
+    list.forEach((x) => {
       const d = document.createElement('div');
-      d.className = 'list-item clickable clip-row';
-      d.innerHTML = `<span>${fmtTime(c.start)}</span><span>${c.duration}s</span><span class="muted">${c.peak} dB</span>` +
-        (c.tag === 'after pause' ? '<span class="tag">after pause</span>' : '') +
-        `<span class="grow"></span><button class="dl" aria-label="Download">⬇</button><button class="rm danger" aria-label="Delete">✕</button>`;
-      d.onclick = (ev) => { if (!ev.target.closest('button')) view.play(i); };
-      d.querySelector('.dl').onclick = () => src.save([{ item: c, name: `sleep_${fileStamp(c.start)}.wav` }]);
-      d.querySelector('.rm').onclick = async () => {
-        if (!confirm('Delete this clip?')) return;
-        await src.deleteClip(c);
-        view.removeClip(c);
-        renderClips(); renderSummary();
-      };
-      clipBox.appendChild(d);
+      d.className = 'list-item clickable snd-row';
+      const cat = x.c ? CATS[x.c] : null;
+      d.innerHTML = `<span>${fmtTime(x.s)}</span><span>${Math.round((x.e - x.s) / 1000)}s</span><span class="muted">${Math.round(x.peak)} dB</span>` +
+        (cat ? `<span class="cat" style="--c:${cat.color}">${cat.name}</span>` : '') + '<span class="grow"></span><span class="muted">▶</span>';
+      d.onclick = () => view.playSound(x);
+      sndBox.appendChild(d);
     });
     view.rowMark = null;
     view.markRows();
   };
-  view.onDataChanged = () => { renderClips(); renderEvents(); renderSummary(); };
+  // category chips: how much of each kind of sound was heard; tap to highlight it
+  const renderChips = () => {
+    const runs = view.runs();
+    chipBox.innerHTML = '';
+    if (!runs.length) return;
+    const secs = {};
+    runs.forEach((r) => { secs[r.c] = (secs[r.c] || 0) + (r.e - r.s) / 1000; });
+    CAT_ORDER.filter((c) => secs[c]).forEach((c) => {
+      const b = document.createElement('button');
+      const n = view.sounds.filter((x) => x.c === c).length;
+      const m = Math.round(secs[c] / 60);
+      b.className = 'chip' + (view.cat === c ? ' on' : '');
+      b.style.setProperty('--c', CATS[c].color);
+      b.innerHTML = `${CATS[c].name} <span>${m ? m + 'm' : Math.round(secs[c]) + 's'}${n ? ' · ' + n : ''}</span>`;
+      b.onclick = () => view.setCategory(c);
+      chipBox.appendChild(b);
+    });
+  };
+
+  // threshold for this night: changes which sounds count as loud
+  const thrIn = el.querySelector('.thr-in'), thrV = el.querySelector('.thr-v');
+  thrIn.value = view.thr; thrV.textContent = view.thr;
+  thrIn.oninput = () => { thrV.textContent = thrIn.value; view.setThreshold(+thrIn.value); };
+
+  view.onDataChanged = () => { renderSounds(); renderChips(); renderEvents(); renderSummary(); };
   view.onDataChanged();
+
+  // recognise the sounds of this night once (saved with the night)
+  const status = el.querySelector('.an-status');
+  const runAnalysis = async () => {
+    const items = view.segs.length ? view.segs : view.clips;
+    if (live || !items.length) { status.textContent = live ? 'after the night' : ''; return; }
+    if (view.s.analysis && view.s.analysis.v === ANALYSIS_VERSION) { status.textContent = ''; return; }
+    status.textContent = 'recognising…';
+    try {
+      const res = await Analyzer.analyze(items, (f) => { status.textContent = `recognising ${Math.round(f * 100)}%`; }, () => view.cancelled);
+      if (!res || view.cancelled) return;
+      view.s.analysis = res;
+      await src.saveAnalysis(res).catch((e) => console.warn('analysis not saved', e));
+      status.textContent = '';
+      view.recalc();
+      view.onDataChanged();
+      view.draw();
+    } catch (e) {
+      console.warn('recognition failed', e);
+      status.textContent = 'recognition unavailable';
+      status.title = String(e && e.message || e);
+    }
+  };
+  runAnalysis();
 
   // actions live in the ⋮ menu of the night screen
   const actions = el.querySelector('.s-actions');
@@ -1175,6 +1223,145 @@ function openNight(list, idx) {
   show(idx);
 }
 
+// ---------------------------------------------------------------- sound recognition
+// Uses Google's YAMNet sound-event model (521 sound classes) through MediaPipe Audio, running on the phone.
+// The Android app ships the model and runtime in vendor/; the web version loads them from a CDN.
+const MP_VERSION = '1.2.2';
+const MP_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@${MP_VERSION}/`;
+const YAMNET_URL = 'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite';
+const ANALYSIS_VERSION = 1;
+
+// Our categories, the YAMNet labels that map to them, and how they are shown
+const CATS = {
+  snore: { name: 'Snoring', color: '#b48cff', re: /^(Snoring|Snort)$/ },
+  gasp: { name: 'Gasp / wheeze', color: '#ff5c6c', re: /^(Gasp|Wheeze|Pant|Choking)$/ },
+  cough: { name: 'Cough', color: '#ff9f43', re: /^(Cough|Throat clearing|Sneeze|Sniff|Hiccup)$/ },
+  breath: { name: 'Breathing', color: '#4fd1c5', re: /^(Breathing|Sigh)$/ },
+  talk: { name: 'Talking', color: '#ffd166', re: /speech|Speech|Conversation|Narration|Whispering|Babbling|Laughter|Groan|Grunt|Whimper|Shout|Yell|Crying|Humming|Singing/ },
+  move: { name: 'Movement', color: '#9aa6bd', re: /Rustl|footsteps|Door|Knock|Tap|Thump|Bang|Creak|Squeak|Zipper|Scratch|Clatter|Rub|Slam|Shuffle|Clothing|Writing/i },
+  other: { name: 'Other', color: '#5f6f8f', re: null },
+};
+const CAT_ORDER = ['snore', 'gasp', 'cough', 'talk', 'breath', 'move', 'other'];
+// sleep-relevant sounds win when the model hears several things in the same second
+const CAT_WEIGHT = { snore: 1.4, gasp: 1.5, cough: 1.3, talk: 1.1, breath: 1, move: 1, other: 1 };
+
+function pickCategory(categories) {
+  const top = categories[0];
+  if (!top || (top.categoryName === 'Silence' && top.score > 0.5)) return null;
+  let best = null;
+  for (const c of categories) {
+    if (c.score < 0.1) continue;
+    const key = CAT_ORDER.find((k) => CATS[k].re && CATS[k].re.test(c.categoryName));
+    if (!key) continue;
+    const w = c.score * CAT_WEIGHT[key];
+    if (!best || w > best.w) best = { c: key, p: c.score, w, l: c.categoryName };
+  }
+  if (best) return best;
+  if (top.categoryName !== 'Silence' && top.score >= 0.3) return { c: 'other', p: top.score, l: top.categoryName };
+  return null;
+}
+
+// merge per-second labels into runs: [{ s, e, c, p, l }]
+function mergeRuns(wins) {
+  wins.sort((a, b) => a.t - b.t);
+  const runs = [];
+  for (const w of wins) {
+    const last = runs[runs.length - 1];
+    if (last && last.c === w.c && w.t - last.e <= 1500) {
+      last.e = w.t + w.d; last.n++;
+      if (w.p > last.p) { last.p = w.p; last.l = w.l; }
+    } else runs.push({ s: w.t, e: w.t + w.d, c: w.c, p: w.p, l: w.l, n: 1 });
+  }
+  // drop single uncertain seconds of background-ish sounds
+  return runs.filter((r) => r.n > 1 || r.p >= 0.3 || ['gasp', 'cough', 'snore'].includes(r.c))
+    .map((r) => ({ s: Math.round(r.s), e: Math.round(r.e), c: r.c, p: Math.round(r.p * 100) / 100, l: r.l }));
+}
+
+const Analyzer = {
+  clf: null, loading: null,
+  load() {
+    if (this.clf) return Promise.resolve(this.clf);
+    if (!this.loading) {
+      this.loading = (async () => {
+        // the Android app has the runtime and model built in; the web version loads them from the internet
+        let base = 'vendor', model = 'vendor/yamnet.tflite', mod;
+        try {
+          if (!NATIVE) throw new Error('web');
+          mod = await import('./vendor/audio_bundle.mjs');
+        } catch {
+          base = MP_CDN + 'wasm'; model = YAMNET_URL;
+          mod = await import(MP_CDN + 'audio_bundle.mjs');
+        }
+        const files = await mod.FilesetResolver.forAudioTasks(base);
+        this.clf = await mod.AudioClassifier.createFromOptions(files, {
+          baseOptions: { modelAssetPath: model }, maxResults: 8, scoreThreshold: 0.05,
+        });
+        return this.clf;
+      })().catch((e) => { this.loading = null; throw e; });
+    }
+    return this.loading;
+  },
+
+  // items: whole-night files (or clips) with { start, duration, blob | src }
+  async analyze(items, onProgress, cancelled) {
+    const clf = await this.load();
+    let ctx;
+    try { ctx = new OfflineAudioContext(1, 1, 16000); } catch { ctx = new OfflineAudioContext(1, 1, 22050); }
+    const total = items.reduce((n, it) => n + it.duration, 0) || 1;
+    let done = 0;
+    const wins = [];
+    for (const it of items) {
+      if (cancelled()) return null;
+      let buf;
+      try {
+        const ab = it.blob ? await it.blob.arrayBuffer() : await (await fetch(it.src)).arrayBuffer();
+        buf = await ctx.decodeAudioData(ab);
+      } catch (e) { console.warn('could not decode', it.id, e); done += it.duration; continue; }
+      const data = buf.getChannelData(0), rate = buf.sampleRate, chunk = rate * 30;
+      for (let off = 0; off < data.length; off += chunk) {
+        if (cancelled()) return null;
+        const part = data.subarray(off, Math.min(data.length, off + chunk));
+        const res = clf.classify(part, rate);
+        const step = res.length ? (part.length / rate) * 1000 / res.length : 975;
+        res.forEach((r, i) => {
+          const pick = pickCategory(r.classifications[0] ? r.classifications[0].categories : []);
+          if (pick) wins.push({ t: it.start + (off / rate) * 1000 + (r.timestampMs ?? i * step), d: step, ...pick });
+        });
+        done += part.length / rate;
+        onProgress(Math.min(1, done / total));
+        await new Promise((r) => setTimeout(r, 0)); // keep the screen responsive
+      }
+    }
+    return { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(wins) };
+  },
+};
+
+// loud sounds = runs of seconds at or above the threshold (gaps up to 3 s are joined)
+function computeSounds(s, thr, runs) {
+  const lv = s.levels || [], out = [];
+  let cur = null;
+  for (let i = 0; i < lv.length; i++) {
+    if (lv[i] < thr) continue;
+    const t = s.start + i * 1000;
+    if (cur && t - cur.e <= 3000) { cur.e = t + 1000; cur.peak = Math.max(cur.peak, lv[i]); }
+    else { if (cur) out.push(cur); cur = { s: t, e: t + 1000, peak: lv[i] }; }
+  }
+  if (cur) out.push(cur);
+  // label each sound with the category heard most during it
+  if (runs) {
+    for (const snd of out) {
+      const tally = {};
+      for (const r of runs) {
+        const ov = Math.min(r.e, snd.e + 1000) - Math.max(r.s, snd.s - 1000);
+        if (ov > 0) tally[r.c] = (tally[r.c] || 0) + ov * CAT_WEIGHT[r.c];
+      }
+      const best = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+      snd.c = best ? best[0] : null;
+    }
+  }
+  return out;
+}
+
 /*
  * Interactive graph of one night + audio player.
  * Two kinds of audio can be played:
@@ -1194,12 +1381,29 @@ class NightView {
     this.mode = null; this.cur = -1; this.tok = 0; this.loadedId = null;
     this.fixing = false; this.pendingOffset = 0;
     this.selEvent = null; this.raf = 0; this.rowMark = null;
+    this.selSound = null;
+    this.cat = null; // category filter (null = all)
+    this.thr = +(lsGet('sleepmon.thr.' + s.id) || s.settings.threshold || 60);
+    this.boost = +(lsGet('sleepmon.boost') || 1);
+    this.sounds = [];
+    this.recalc();
     this.t0 = s.start;
     this.v0 = this.t0; this.v1 = this.tEnd();
 
     const q = (c) => root.querySelector(c);
     this.ui = { play: q('.p-play'), prev: q('.p-prev'), next: q('.p-next'), title: q('.p-title'),
-      seek: q('.p-seek'), time: q('.p-time'), zlabel: q('.z-label') };
+      seek: q('.p-seek'), time: q('.p-time'), boost: q('.p-boost') };
+    // volume boost for quiet sounds (x1 .. x16, with a limiter so loud parts don't distort)
+    this.ui.boost.textContent = '×' + this.boost;
+    this.ui.boost.onclick = () => {
+      const steps = [1, 2, 4, 8, 16];
+      this.boost = steps[(steps.indexOf(this.boost) + 1) % steps.length];
+      lsSet('sleepmon.boost', this.boost);
+      this.ui.boost.textContent = '×' + this.boost;
+      this.ui.boost.classList.toggle('on', this.boost > 1);
+      this.audioGraph();
+    };
+    this.ui.boost.classList.toggle('on', this.boost > 1);
 
     q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
     q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
@@ -1238,18 +1442,61 @@ class NightView {
 
   destroy() {
     this.pause();
+    this.cancelled = true;
+    if (this.ac) this.ac.close().catch(() => {});
     window.removeEventListener('resize', this.onResize);
     clearInterval(this.liveTimer);
     this.urls.forEach((u) => URL.revokeObjectURL(u));
   }
 
-  countKey() { return [this.clips.length, this.segs.length, this.s.events.length].join(); }
+  countKey() { return [this.clips.length, this.segs.length, this.s.events.length, this.sounds.length].join(); }
+
+  // ---- threshold, sounds and categories
+  recalc() {
+    this.sounds = computeSounds(this.s, this.thr, this.s.analysis && this.s.analysis.runs);
+  }
+  setThreshold(v) {
+    this.thr = v;
+    lsSet('sleepmon.thr.' + this.s.id, v);
+    this.recalc();
+    this.rowMark = null;
+    if (this.onDataChanged) this.onDataChanged();
+    this.draw();
+  }
+  setCategory(c) {
+    this.cat = this.cat === c ? null : c;
+    this.rowMark = null;
+    if (this.onDataChanged) this.onDataChanged();
+    this.draw();
+  }
+  soundList() { return this.cat ? this.sounds.filter((x) => x.c === this.cat) : this.sounds; }
+  runs() { return (this.s.analysis && this.s.analysis.runs) || []; }
+  catAt(t) { const r = this.runs().find((x) => t >= x.s && t < x.e); return r || null; }
+
+  // route playback through Web Audio so it can be amplified
+  audioGraph() {
+    if (!this.ac) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      try {
+        this.ac = new AC();
+        const src = this.ac.createMediaElementSource(this.audio);
+        this.gain = this.ac.createGain();
+        const lim = this.ac.createDynamicsCompressor();
+        lim.threshold.value = -6; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.003; lim.release.value = 0.2;
+        src.connect(this.gain); this.gain.connect(lim); lim.connect(this.ac.destination);
+      } catch (e) { console.warn('boost unavailable', e); this.ac = null; return; }
+    }
+    if (this.ac.state === 'suspended') this.ac.resume().catch(() => {});
+    this.gain.gain.value = this.boost;
+  }
 
   async reload() {
     let d;
     try { d = await this.src.load(); } catch { return; }
     const it = this.item();
     this.s = d.s; this.clips = d.clips; this.segs = d.segs;
+    this.recalc();
     if (it) this.cur = this.list().findIndex((x) => x.id === it.id);
     if (this.cur < 0) this.mode = null;
     const key = this.countKey();
@@ -1303,6 +1550,7 @@ class NightView {
   playAt(t, clipIdx = -1) {
     const gi = this.segAt(t);
     if (gi >= 0) return this.playItem('seg', gi, (t - this.segs[gi].start) / 1000);
+    if (clipIdx < 0) clipIdx = this.clips.findIndex((c) => t >= c.start - 2000 && t <= this.endOf(c));
     if (clipIdx >= 0) {
       const c = this.clips[clipIdx];
       this.playItem('clip', clipIdx, t >= c.start && t <= this.endOf(c) ? (t - c.start) / 1000 : 0);
@@ -1336,6 +1584,7 @@ class NightView {
       a.src = this.url(it);
       a.addEventListener('loadedmetadata', seekTo, { once: true });
     } else seekTo();
+    this.audioGraph();
     a.play().catch(() => {}); // called right away so it counts as a user gesture on iPhone
     this.ensureVisible(it.start + offset * 1000);
     this.markRows();
@@ -1364,18 +1613,25 @@ class NightView {
 
   pause() { if (!this.audio.paused) this.audio.pause(); }
 
-  // previous / next loud sound (clip). With a whole-night recording, play it in context from there.
-  targetClip(dir) {
-    const t = this.curT();
-    if (t === null) return dir > 0 ? (this.clips.length ? 0 : -1) : -1;
-    if (dir > 0) return this.clips.findIndex((c) => c.start > t + 1000);
-    for (let i = this.clips.length - 1; i >= 0; i--) if (this.clips[i].start < t - 3000) return i;
-    return -1;
+  // previous / next loud sound (of the selected category)
+  targetSound(dir) {
+    const list = this.soundList(), t = this.curT();
+    if (t === null) return dir > 0 ? list[0] || null : null;
+    if (dir > 0) return list.find((x) => x.s > t + 1000) || null;
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].s < t - 3000) return list[i];
+    return null;
   }
 
   jump(dir) {
-    const i = this.targetClip(dir);
-    if (i >= 0) this.playAt(this.clips[i].start, i);
+    const x = this.targetSound(dir);
+    if (x) this.playSound(x);
+  }
+
+  playSound(x) {
+    this.selSound = x;
+    const span = Math.max(60000, (x.e - x.s) * 6);
+    if (this.v1 - this.v0 > span * 3 || x.s < this.v0 || x.e > this.v1) this.setView((x.s + x.e) / 2 - span / 2, (x.s + x.e) / 2 + span / 2);
+    this.playAt(Math.max(this.t0, x.s - 1500));
   }
 
   removeClip(c) {
@@ -1407,12 +1663,11 @@ class NightView {
   revoke(id) { if (this.urls.has(id)) { URL.revokeObjectURL(this.urls.get(id)); this.urls.delete(id); } }
 
   markRows() {
-    let idx = -1;
-    if (this.mode === 'clip') idx = this.cur;
-    else if (this.mode === 'seg') { const t = this.curT(); idx = this.clips.findIndex((c) => t >= c.start && t <= this.endOf(c)); }
+    const t = this.curT(), list = this.soundList();
+    const idx = t === null ? -1 : list.findIndex((x) => t >= x.s - 1500 && t <= x.e + 500);
     if (idx === this.rowMark) return;
     this.rowMark = idx;
-    this.root.querySelectorAll('.clip-row').forEach((r, i) => {
+    this.root.querySelectorAll('.snd-row').forEach((r, i) => {
       r.classList.toggle('playing', i === idx);
       if (i === idx) {
         // keep the playing clip visible inside the clips window (without moving the page)
@@ -1427,8 +1682,8 @@ class NightView {
   updatePlayer() {
     const it = this.item(), u = this.ui;
     const hasAudio = this.clips.length || this.segs.length;
-    u.prev.disabled = this.targetClip(-1) < 0;
-    u.next.disabled = this.targetClip(1) < 0;
+    u.prev.disabled = !this.targetSound(-1);
+    u.next.disabled = !this.targetSound(1);
     u.play.disabled = !hasAudio;
     if (!it) {
       u.title.textContent = this.segs.length ? 'Tap the graph to listen to any moment'
@@ -1439,8 +1694,8 @@ class NightView {
     const at = this.pos(), t = this.curT();
     if (this.mode === 'seg') {
       const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
-      const loud = this.clips.some((c) => t >= c.start && t <= this.endOf(c));
-      u.title.textContent = `Whole night · ${fmtTime(t)}` + (ev ? ' · breathing pause' : loud ? ' · loud sound' : '');
+      const r = this.catAt(t);
+      u.title.textContent = `${fmtTime(t)}` + (ev ? ' · breathing pause' : r ? ' · ' + (r.c === 'other' ? r.l : CATS[r.c].name) : '');
     } else {
       u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(t)} · peak ${it.peak} dB` +
         (it.tag === 'after pause' ? ' · after pause' : '');
@@ -1550,6 +1805,8 @@ class NightView {
     const ci = this.clipAt(x);
     let html = `${fmtTime(t)}${lvl !== null ? ` · ${Math.round(lvl)} dB` : ''}`;
     if (ev) html += `<br>Breathing pause ${ev.duration}s`;
+    const r = this.catAt(t);
+    if (r) html += `<br><span style="color:${CATS[r.c].color}">● ${r.c === 'other' ? r.l : CATS[r.c].name}</span>`;
     if (this.segAt(t) >= 0) html += '<br><b>Tap to listen</b>';
     else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
     this.tip.innerHTML = html;
@@ -1560,6 +1817,7 @@ class NightView {
   tap(x) {
     const t = this.tAt(x);
     this.selEvent = this.s.events.find((e) => t >= e.start && t <= e.end) || null;
+    this.selSound = this.soundList().find((s) => t >= s.s - 1000 && t <= s.e + 1000) || null;
     const ci = this.clipAt(x);
     if (this.segAt(t) >= 0 || ci >= 0) {
       this.playAt(t, ci);
@@ -1578,7 +1836,6 @@ class NightView {
     const s = this.s, ch = h - 18; // bottom strip for time labels
     const y = (db) => yOf(db, ch);
     const span = this.v1 - this.v0;
-    this.ui.zlabel.textContent = `${fmtTime(this.v0)} – ${fmtTime(this.v1)}`;
 
     // dB grid
     g.font = '10px system-ui'; g.fillStyle = css('--muted');
@@ -1606,31 +1863,41 @@ class NightView {
       g.fillRect(x0, 0, Math.max(2, x1 - x0), ch);
     });
 
-    // threshold
-    g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
-    g.moveTo(0, y(s.settings.threshold)); g.lineTo(w, y(s.settings.threshold)); g.stroke(); g.setLineDash([]);
-
-    // whole-night recording coverage: green strip along the top
-    g.fillStyle = css('--ok');
-    this.segs.forEach((sg) => {
-      const x0 = this.xOf(sg.start), x1 = this.xOf(this.endOf(sg));
+    // recognised sounds: colored band along the top; the selected category is also highlighted over the graph
+    this.runs().forEach((r) => {
+      const x0 = this.xOf(r.s), x1 = this.xOf(r.e);
       if (x1 < 0 || x0 > w) return;
-      g.fillRect(x0, 0, Math.max(1, x1 - x0), 4);
+      const cw = Math.max(2, x1 - x0);
+      if (this.cat && r.c !== this.cat) { g.globalAlpha = 0.25; }
+      g.fillStyle = CATS[r.c].color;
+      g.fillRect(x0, 0, cw, 8);
+      if (this.cat === r.c) { g.globalAlpha = 0.22; g.fillRect(x0, 8, cw, ch - 8); }
+      g.globalAlpha = 1;
     });
 
-    // clips
-    const clipCol = css('--clip');
-    this.clips.forEach((c, i) => {
-      const x0 = this.xOf(c.start), x1 = this.xOf(this.endOf(c));
+    // threshold (adjustable for this night)
+    g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.beginPath();
+    g.moveTo(0, y(this.thr)); g.lineTo(w, y(this.thr)); g.stroke(); g.setLineDash([]);
+
+    // loud sounds above the threshold: markers along the bottom, colored by what they are
+    this.soundList().forEach((x) => {
+      const x0 = this.xOf(x.s), x1 = this.xOf(x.e);
       if (x1 < 0 || x0 > w) return;
       const cw = Math.max(3, x1 - x0);
-      if (this.mode === 'clip' && i === this.cur) {
-        g.fillStyle = 'rgba(242,201,76,.18)'; g.fillRect(x0, 0, cw, ch);
-        g.fillStyle = clipCol; g.fillRect(x0, ch - 10, cw, 10);
-      } else {
-        g.fillStyle = clipCol; g.fillRect(x0, ch - 6, cw, 6);
-      }
+      g.fillStyle = x.c ? CATS[x.c].color : '#e6ebf5';
+      if (x === this.selSound) { g.globalAlpha = 0.2; g.fillRect(x0, 8, cw, ch - 8); g.globalAlpha = 1; g.fillRect(x0, ch - 10, cw, 10); }
+      else g.fillRect(x0, ch - 6, cw, 6);
     });
+
+    // saved clips (only when there is no whole-night recording to play from)
+    if (!this.segs.length) {
+      g.fillStyle = css('--clip');
+      this.clips.forEach((c) => {
+        const x0 = this.xOf(c.start), x1 = this.xOf(this.endOf(c));
+        if (x1 < 0 || x0 > w) return;
+        g.fillRect(x0, ch - 13, Math.max(3, x1 - x0), 3);
+      });
+    }
 
     // playhead
     const t = this.curT();

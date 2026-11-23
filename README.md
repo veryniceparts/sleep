@@ -52,6 +52,24 @@ Everything fits on one screen:
 - **Past nights:** a 4×2 grid for one week, with Monday–Sunday plus a week summary (nights, average hours, pauses per hour). Each tile shows the start time, length, a small graph and pauses per hour, colored green/yellow/orange/red by the clinical grading bands. Switch weeks with ‹ › or by swiping the grid. **+1** means more than one recording that night. A night that starts after midnight counts as the previous evening.
 - **⋮ menu:** record the whole night, auto-set threshold, night mode, battery settings (Android) and all detection settings.
 
+## Sound recognition
+
+The whole night is always recorded. When you open a night, the app identifies its sounds once and saves the result. It uses Google's YAMNet sound-event model (521 sound classes) through MediaPipe, running on the phone, so no audio is uploaded. Each second is labelled **Snoring**, **Gasp / wheeze**, **Cough**, **Talking**, **Breathing**, **Movement** or **Other**:
+
+- A colored band along the top of the graph shows what was heard and when.
+- Chips above the **Sounds** list show how long each kind lasted. Tap one to highlight it on the graph and filter the list.
+- Each loud sound in the list is labelled with what it most likely is.
+
+The Android app has the model built in, so it works offline. The web version downloads it (about 26 MB) the first time.
+
+## Changing the threshold afterwards
+
+The **Loud ≥** slider in a night changes which sounds count as loud for that night. The Sounds list and the markers update immediately, and each night remembers its own setting.
+
+## Amplifying playback
+
+The **×1** button in the player boosts quiet recordings ×2, ×4, ×8 or ×16. A limiter keeps loud parts from distorting.
+
 ## Checking a night: graph and replay
 
 Tap a day in the grid to open that night full screen. The phone's Back button or ‹ returns to the grid.
