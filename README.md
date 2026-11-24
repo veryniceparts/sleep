@@ -1,17 +1,16 @@
 # Sleep Apnea Monitor
 
-A web app you install on your phone. It listens to you while you sleep and:
+An app for your phone that listens while you sleep:
 
-- **records and saves every sound louder than your threshold** (snoring, gasping, choking) as a WAV clip. Each clip includes a few seconds from before the sound started, so you hear what led up to it.
-- **detects breathing pauses**: it hears normal breathing or snoring, then silence for at least 10 s, then breathing again. Each pause is logged as a possible apnea event, along with whether breathing restarted with a loud gasp or snort.
-- shows an **interactive graph of each night** with sound level, threshold, breathing pauses and saved clips, plus **pauses per hour**.
-- can optionally **record the whole night** (compressed, about 15 MB per hour), so you can listen to any moment, not only the loud ones.
-- lets you **replay** what happened: tap anywhere on the graph to hear that moment, or play every clip one after another to replay the night.
-- lets you download and delete clips, and **export a CSV** of the night to show your doctor.
+- **records the whole night** (compressed, about 15 MB per hour) and saves a WAV clip of every sound louder than your threshold;
+- **recognises the sounds** afterwards (snoring, gasp/wheeze, cough, talking, breathing, movement) with an on-device model, and highlights them on the night's graph;
+- shows **past nights as a weekly grid**, with each night's length, a small graph and its snoring time;
+- lets you **replay any moment** by tapping the graph, **amplify** quiet sounds and **change the loudness threshold** after recording;
+- **in the Android app, keeps recording with the screen off or while you use other apps**.
 
 Everything stays on your phone in the browser's storage. Nothing is uploaded.
 
-> ⚠️ **Not a medical device.** A microphone can't measure airflow or blood oxygen, so it misses some apneas and some pauses it reports aren't apneas. Use it to decide whether to see a doctor and to show them what happens at night. A sleep study is the only real diagnosis.
+> ⚠️ **Not a medical device.** A microphone can't measure airflow or blood oxygen, so it can't detect apnea reliably. Use it to decide whether to see a doctor and to show them what happens at night. A sleep study is the only real diagnosis.
 
 ## Download the Android app
 
@@ -21,7 +20,7 @@ Open the link on your Android phone, open the downloaded file and tap **Install*
 
 A new APK is built automatically by GitHub Actions on every push (see *Actions* and *Releases*). All builds are signed with the same key, so a new version installs over the old one and keeps your recordings. In the app, **Download** buttons open Android's share sheet, so you can save files to Files or Drive, or send them by email or a messaging app.
 
-**Screen off and other apps:** in the Android app, monitoring runs in a background service, shown by a "Monitoring your sleep" notification with a Stop button. You can lock the phone or use other apps all night. It records the microphone natively (clips as WAV, the whole night as AAC .m4a files) and does the same breathing-pause detection. When you tap Start the first time, allow the microphone and notifications. The app also offers to turn off battery restrictions, so aggressive power savers (Samsung, Xiaomi, Huawei, ...) don't stop it during the night.
+**Screen off and other apps:** in the Android app, monitoring runs in a background service, shown by a "Monitoring your sleep" notification with a Stop button. You can lock the phone or use other apps all night. It records the microphone natively (clips as WAV, the whole night as AAC .m4a files). When you tap Start the first time, allow the microphone and notifications. The app also offers to turn off battery restrictions, so aggressive power savers (Samsung, Xiaomi, Huawei, ...) don't stop it during the night.
 
 iPhone can't install APKs. Use the web version below and *Add to Home Screen*.
 
@@ -49,7 +48,7 @@ Then use **Add to Home Screen** (iOS Safari) or **Install app** (Android Chrome)
 Everything fits on one screen:
 
 - **Live card:** the dB level and live graph work as soon as the app opens. **Start** turns into **Stop** while monitoring. The red line is the recording threshold, which you can adjust with the slider.
-- **Past nights:** a 4×2 grid for one week, with Monday–Sunday plus a week summary (nights, average hours, pauses per hour). Each tile shows the start time, length, a small graph and pauses per hour, colored green/yellow/orange/red by the clinical grading bands. Switch weeks with ‹ › or by swiping the grid. **+1** means more than one recording that night. A night that starts after midnight counts as the previous evening.
+- **Past nights:** a 4×2 grid for one week, with Monday–Sunday plus a week summary (nights, average hours, average snoring). Each tile shows the start time, length, a small graph and the snoring time. Switch weeks with ‹ › or by swiping the grid. **+1** means more than one recording that night. A night that starts after midnight counts as the previous evening.
 - **⋮ menu:** record the whole night, auto-set threshold, night mode, battery settings (Android) and all detection settings.
 
 ## Sound recognition
@@ -75,12 +74,11 @@ The **×1** button in the player boosts quiet recordings ×2, ×4, ×8 or ×16. 
 Tap a day in the grid to open that night full screen. The phone's Back button or ‹ returns to the grid.
 
 
-- **Graph:** the blue area is sound level, the red dashed line is your threshold, orange bands are breathing pauses and yellow marks along the bottom are saved clips.
+- **Graph:** the blue area is sound level and the red dashed line is the night's threshold. The colored band along the top shows recognised sounds, and the marks along the bottom are loud sounds, colored by type.
 - **Green strip along the top:** parts of the night covered by the whole-night recording.
 - **Tap the graph** to play the sound at that moment. With a whole-night recording, any moment can be played and playback keeps going through the night. Without one, only the saved clips can be played. A white playhead moves across the graph while it plays, and the graph scrolls to follow it.
 - **Zoom and scroll:** pinch, use the mouse wheel or the **+ / −** buttons to zoom from the whole night down to 30 s. Drag sideways to scroll. **Whole night** zooms back out.
-- **Player:** play/pause, previous/next loud sound and a seek bar. Tick **Play all clips** to play the whole night's clips in order.
-- **Tap a breathing pause** in the list to zoom to it. With a whole-night recording it plays from 5 s before the pause, so you hear the last breaths, the silence and the restart. Without one, it plays the clip from when breathing restarted.
+- **Player:** play/pause, previous/next loud sound (of the selected type), a seek bar and the **×1–×16** volume boost.
 - **Tap a clip** in the list to play it on the graph.
 
 You can open History while monitoring is still running. The graph keeps growing as the night is recorded.
@@ -93,15 +91,8 @@ You can open History while monitoring is still running. The graph keeps growing 
 | Pre-roll | 3 s | Audio kept from before the trigger |
 | Stop after quiet for | 4 s | A clip ends after this much quiet |
 | Max clip length | 60 s | Long sounds are split into clips of this length |
-| Minimum pause | 10 s | Shortest silence counted as a breathing pause (the clinical apnea definition) |
-| Ignore pauses longer than | 90 s | Longer silences are probably not apneas (for example, you rolled away from the mic) |
-| Breath sensitivity | 6 dB | How far above the room's noise floor a sound must be to count as a breath |
-| Breaths needed before a pause | 3 | Audible breaths required in the minute before a pause, so random silence isn't counted |
-| Save clip after pause | on | Always record the moment breathing restarts, even if it is quiet |
 
 Levels are relative: 0 dB is digital silence and about 100 dB is the loudest the mic can capture. They aren't calibrated SPL readings.
-
-**Tip:** pause detection only works if the app can hear your normal breathing. If you get 0 pauses and the live chart doesn't move when you breathe, move the phone closer or lower *Breath sensitivity*.
 
 ## Storage
 
@@ -124,7 +115,7 @@ The Android project is a [Capacitor](https://capacitorjs.com) wrapper around the
 ## Files
 
 - `index.html`, `styles.css`: the user interface
-- `app.js`: audio capture, level detection, clip recording, pause detection, IndexedDB storage, charts
+- `app.js`: audio capture, level meter, clip and whole-night recording, sound recognition, IndexedDB storage, graphs
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline support and installing as an app
 - `android/`, `capacitor.config.json`, `package.json`: Android app wrapper
 - `.github/workflows/android.yml`: builds the APK and publishes it as a GitHub release

@@ -30,7 +30,6 @@
       </div>
       <div class="meter">
         <div id="meterBar" class="meter-bar"></div>
-        <div id="meterFloor" class="meter-mark floor" title="Breath level"></div>
         <div id="meterThreshold" class="meter-mark threshold" title="Recording threshold"></div>
       </div>
       <canvas id="liveChart"></canvas>
@@ -78,17 +77,6 @@
         <label class="field row-field"><span>Max clip length (s)</span>
           <input type="number" id="setMaxClip" min="5" max="300" step="5"></label>
 
-        <h3>Breathing pauses</h3>
-        <label class="field row-field"><span>Minimum pause (s)</span>
-          <input type="number" id="setApneaGap" min="5" max="60" step="1"></label>
-        <label class="field row-field"><span>Ignore pauses longer than (s)</span>
-          <input type="number" id="setApneaMax" min="20" max="300" step="5"></label>
-        <label class="field row-field"><span>Breath sensitivity (dB above floor)</span>
-          <input type="number" id="setBreathMargin" min="2" max="30" step="1"></label>
-        <label class="field row-field"><span>Breaths needed before a pause</span>
-          <input type="number" id="setMinBreaths" min="1" max="20" step="1"></label>
-        <label class="field check"><input type="checkbox" id="setClipPauses">
-          <span>Save a clip when breathing restarts after a pause</span></label>
 
         <div class="actions"><button id="btnResetSettings">Reset to defaults</button></div>
         <p class="muted small" id="storageInfo"></p>
@@ -149,10 +137,6 @@
       </div>
 
       <div class="s-lists">
-        <section class="s-panel">
-          <div class="s-panel-head">Breathing pauses <span class="n-ev"></span></div>
-          <div class="s-list-body s-events"></div>
-        </section>
         <section class="s-panel">
           <div class="s-panel-head">Sounds <span class="n-cl"></span> <span class="an-status"></span></div>
           <div class="cat-chips"></div>

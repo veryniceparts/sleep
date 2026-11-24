@@ -41,7 +41,6 @@ import java.util.concurrent.TimeUnit;
  * Same logic as the web version (app.js):
  *  - level of each 64 ms frame in relative dB (0 = silence, ~100 = full scale)
  *  - clips: WAV files of sounds above the threshold, with pre-roll
- *  - breathing pauses: audible breathing, then silence >= apneaGap s, then sound again
  *  - optional whole-night recording as 10-minute AAC (.m4a) files
  *
  * Data per night lives in files/sleep/<sessionId>/ (session.json + audio files), in the same
@@ -59,7 +58,6 @@ public class SleepService extends Service {
     static final int FRAME = 1024;                       // 64 ms
     static final double FRAME_SEC = FRAME / (double) RATE;
     static final long SEGMENT_MS = 10 * 60 * 1000L;
-    static final int LIVE_FRAMES = (int) Math.ceil(60 / FRAME_SEC);
 
     static volatile SleepService instance;
 
@@ -70,9 +68,8 @@ public class SleepService extends Service {
     private PowerManager.WakeLock wakeLock;
 
     // ---- settings (may change while running)
-    volatile double threshold = 60, preRoll = 3, postRoll = 4, maxClip = 60, apneaGap = 10, apneaMax = 90, breathMargin = 6;
-    volatile int minBreaths = 3;
-    volatile boolean clipPauses = true, recordAll = false;
+    volatile double threshold = 60, preRoll = 3, postRoll = 4, maxClip = 60;
+    volatile boolean recordAll = true;
     private JSONObject settingsJson = new JSONObject();
 
     // ---- session (guarded by lock)
@@ -80,15 +77,12 @@ public class SleepService extends Service {
     String sessionId;
     long start;
     private final ArrayList<Float> levels = new ArrayList<>();
-    private final JSONArray events = new JSONArray();
     private final JSONArray clips = new JSONArray();
     private final JSONArray segments = new JSONArray();
-    private final float[] live = new float[LIVE_FRAMES];
-    private int liveCount = 0, livePos = 0;
 
     // ---- live state
-    volatile double level = 0, floor = -1;
-    volatile boolean clipActive = false, silent = false;
+    volatile double level = 0;
+    volatile boolean clipActive = false;
     volatile long fullBytes = 0;
 
     // ---- processing state (worker thread only)
@@ -101,13 +95,6 @@ public class SleepService extends Service {
     private long clipStart = 0, clipLastLoud = 0;
     private double clipPeak = 0;
     private String clipTag = "loud";
-    private long lastActive = 0, inactiveSince = 0;
-    private boolean wasActive = false;
-    private final ArrayDeque<Long> bursts = new ArrayDeque<>();
-    private long silenceStart = -1;
-    private int silenceBreaths = 0;
-    private JSONObject pendingResume = null;
-    private long pendingUntil = 0;
     private AacWriter aac = null;
 
     static File rootDir(Context c) {
@@ -146,11 +133,6 @@ public class SleepService extends Service {
             preRoll = o.optDouble("preRoll", preRoll);
             postRoll = o.optDouble("postRoll", postRoll);
             maxClip = o.optDouble("maxClip", maxClip);
-            apneaGap = o.optDouble("apneaGap", apneaGap);
-            apneaMax = o.optDouble("apneaMax", apneaMax);
-            breathMargin = o.optDouble("breathMargin", breathMargin);
-            minBreaths = o.optInt("minBreaths", minBreaths);
-            clipPauses = o.optBoolean("clipPauses", clipPauses);
             recordAll = o.optBoolean("recordAll", recordAll);
             synchronized (lock) {
                 // the night keeps the threshold it was started with for its graph, but follows later changes
@@ -170,16 +152,13 @@ public class SleepService extends Service {
             dir = new File(rootDir(this), sessionId);
             dir.mkdirs();
             levels.clear();
-            while (events.length() > 0) events.remove(0);
             while (clips.length() > 0) clips.remove(0);
             while (segments.length() > 0) segments.remove(0);
-            liveCount = 0; livePos = 0;
         }
-        level = 0; floor = -1; clipActive = false; silent = false; fullBytes = 0;
+        level = 0; clipActive = false; fullBytes = 0;
         secMax = 0; secStart = now; lastSave = now; lastNotif = now;
         preBuf.clear(); preLen = 0; clipChunks = null; clipLen = 0;
-        lastActive = now; inactiveSince = now; wasActive = false; bursts.clear();
-        silenceStart = -1; pendingResume = null; aac = null;
+        aac = null;
 
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SleepMonitor:monitor");
@@ -259,25 +238,20 @@ public class SleepService extends Service {
         for (int i = 0; i < n; i++) { double v = buf[i] / 32768.0; sum += v * v; }
         double lv = Math.max(0, 20 * Math.log10(Math.sqrt(sum / n) + 1e-10) + 100);
         level = lv;
-        // noise floor: drops quickly, rises very slowly (follows the quiet room, not breathing)
-        if (floor < 0) floor = lv;
-        else if (lv < floor) floor += (lv - floor) * 0.3;
-        else floor += (lv - floor) * 0.0004;
 
         synchronized (lock) {
-            live[livePos] = (float) lv;
-            livePos = (livePos + 1) % LIVE_FRAMES;
-            if (liveCount < LIVE_FRAMES) liveCount++;
+            // per-second maximum; seconds without audio (microphone taken by a call, ...) are stored as 0
             secMax = Math.max(secMax, lv);
-            while (now - secStart >= 1000) {
+            if (now - secStart >= 1000) {
                 levels.add(Math.round(secMax * 10) / 10f);
-                secMax = lv; secStart += 1000;
+                secStart += 1000;
+                while (now - secStart >= 1000) { levels.add(0f); secStart += 1000; }
+                secMax = lv;
             }
         }
 
         short[] chunk = Arrays.copyOf(buf, n);
         handleClip(chunk, lv, now);
-        handleBreathing(lv, now);
         handleFullRecording(chunk, now);
 
         if (now - lastSave > 30000) { lastSave = now; saveSession(); }
@@ -348,52 +322,6 @@ public class SleepService extends Service {
         }
     }
 
-    // ---- breathing pause detection
-    private void handleBreathing(double lv, long now) {
-        boolean active = lv >= floor + breathMargin;
-        // count breath/snore onsets (sound after >= 0.7 s of quiet)
-        if (active && !wasActive && now - inactiveSince >= 700) bursts.addLast(now);
-        if (!active && wasActive) inactiveSince = now;
-        wasActive = active;
-        while (!bursts.isEmpty() && now - bursts.peekFirst() > 180000) bursts.removeFirst();
-
-        if (active) {
-            if (silenceStart >= 0) {
-                double gap = (now - silenceStart) / 1000.0;
-                if (gap >= apneaGap && gap <= apneaMax && silenceBreaths >= minBreaths) {
-                    try {
-                        JSONObject ev = new JSONObject();
-                        ev.put("start", silenceStart);
-                        ev.put("end", now);
-                        ev.put("duration", Math.round(gap * 10) / 10.0);
-                        ev.put("loudResume", false);
-                        synchronized (lock) { events.put(ev); }
-                        pendingResume = ev; pendingUntil = now + 3000;
-                    } catch (JSONException ignored) { }
-                    if (clipPauses && clipChunks == null) startClip(now, "after pause");
-                    else if (clipChunks != null && "loud".equals(clipTag)) clipTag = "after pause";
-                    saveSession();
-                }
-                silenceStart = -1;
-                silent = false;
-            }
-            lastActive = now;
-        } else if (silenceStart < 0 && now - lastActive > 1500) {
-            silenceStart = lastActive;
-            int b = 0;
-            for (long t : bursts) if (t <= silenceStart && silenceStart - t <= 60000) b++;
-            silenceBreaths = b;
-            silent = true;
-        }
-
-        if (pendingResume != null) {
-            if (lv >= threshold) {
-                synchronized (lock) { try { pendingResume.put("loudResume", true); } catch (JSONException ignored) { } }
-                pendingResume = null;
-            } else if (now > pendingUntil) pendingResume = null;
-        }
-    }
-
     // ---- whole-night recording
     private void handleFullRecording(short[] chunk, long now) {
         if (recordAll && aac == null) {
@@ -461,7 +389,7 @@ public class SleepService extends Service {
                     for (Float f : levels) lv.put((double) f);
                     s.put("levels", lv);
                 }
-                s.put("events", new JSONArray(events.toString()));
+                s.put("events", new JSONArray()); // breathing pauses are no longer detected
                 s.put("clips", new JSONArray(clips.toString()));
                 s.put("segments", new JSONArray(segments.toString()));
             } catch (JSONException ignored) { }
@@ -477,7 +405,6 @@ public class SleepService extends Service {
                 s.put("start", start);
                 s.put("end", System.currentTimeMillis());
                 s.put("clipCount", clips.length());
-                s.put("eventCount", events.length());
             } catch (JSONException ignored) { }
         }
         return s;
@@ -520,21 +447,13 @@ public class SleepService extends Service {
         try {
             o.put("running", running);
             o.put("level", level);
-            o.put("floor", floor < 0 ? JSONObject.NULL : floor);
             o.put("clipActive", clipActive);
-            o.put("silent", silent);
             o.put("recordAll", recordAll);
             o.put("fullBytes", currentFullBytes());
-            o.put("frameSec", FRAME_SEC);
             synchronized (lock) {
                 o.put("sessionId", sessionId);
                 o.put("start", start);
                 o.put("clipCount", clips.length());
-                o.put("eventCount", events.length());
-                JSONArray lv = new JSONArray();
-                int first = (livePos - liveCount + LIVE_FRAMES) % LIVE_FRAMES;
-                for (int i = 0; i < liveCount; i++) lv.put(Math.round(live[(first + i) % LIVE_FRAMES] * 10) / 10.0);
-                o.put("live", lv);
             }
         } catch (JSONException ignored) { }
         return o;
@@ -558,8 +477,8 @@ public class SleepService extends Service {
         String text;
         synchronized (lock) {
             long el = (System.currentTimeMillis() - start) / 60000;
-            text = start == 0 ? "Listening…" : String.format(Locale.US, "%d:%02d · %d pauses · %d clips%s",
-                    el / 60, el % 60, events.length(), clips.length(), recordAll ? " · recording all" : "");
+            text = start == 0 ? "Listening…" : String.format(Locale.US, "%d:%02d · %d loud sounds",
+                    el / 60, el % 60, clips.length());
         }
         return new NotificationCompat.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)

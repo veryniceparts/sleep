@@ -1,12 +1,10 @@
 'use strict';
 /*
- * Sleep Apnea Monitor
- * - Listens to the microphone and shows a live sound level (relative dB).
- * - Saves an audio clip (WAV) whenever sound goes above the threshold, including a few
- *   seconds of audio from before the sound started (pre-roll).
- * - Detects breathing pauses: regular breathing/snoring sounds, then silence for at least
- *   N seconds, then sound again. These are logged as possible apnea events.
- * - Everything is stored on the device in IndexedDB.
+ * Sleep Monitor
+ * - Live sound level (relative dB) as soon as the app opens.
+ * - Records the whole night (compressed, 10-minute files) plus a WAV clip of every sound above the threshold.
+ * - After the night, recognises sounds (snoring, cough, talking, ...) on the phone with YAMNet.
+ * - Browser: everything in IndexedDB. Android app: a native background service records (see android/).
  */
 
 // ---------------------------------------------------------------- settings
@@ -15,15 +13,10 @@ const DEFAULTS = {
   preRoll: 3,        // s of audio kept before the trigger
   postRoll: 4,       // s of quiet before a clip ends
   maxClip: 60,       // s max clip length
-  apneaGap: 10,      // s min breathing pause
-  apneaMax: 90,      // s pauses longer than this are ignored
-  breathMargin: 6,   // dB above noise floor that counts as a breath
-  minBreaths: 3,     // breath sounds required in 60 s before a pause
-  clipPauses: true,  // save a clip when breathing restarts after a pause
   recordAll: true,   // record the whole night (compressed)
 };
 const CLIP_RATE = 16000;     // saved audio sample rate (Hz)
-const LIVE_SECONDS = 60;     // live chart window
+const LIVE_SECONDS = 60;     // live chart window (s)
 const SEGMENT_MS = 10 * 60 * 1000; // whole-night recording is saved in 10-minute files
 const FULL_BITRATE = 32000;  // bits/s for whole-night recording (~14 MB per hour)
 
@@ -156,19 +149,11 @@ const WebMonitor = {
   running: false,
   ctx: null, stream: null, src: null, proc: null, sink: null,
   session: null,
-  // per-frame state
-  floor: null, level: 0,
-  preBuf: [], preLen: 0,
-  clip: null,                 // { start, chunks, len, peak, lastLoud, tag }
-  lastActive: 0, wasActive: false, inactiveSince: 0,
-  bursts: [],                 // timestamps of breath/snore sound onsets
-  silence: null,              // { start, breaths }
-  pendingResume: null,        // event waiting to see if breathing restarted loudly
-  secMax: 0, secStart: 0,     // per-second level aggregation for history chart
-  live: [],                   // recent levels for live chart
+  level: 0,
+  preBuf: [], preLen: 0,      // pre-roll audio kept before a clip starts
+  clip: null,                 // clip being recorded: { start, chunks, len, peak, lastLoud, tag }
+  secMax: 0, secStart: 0,     // per-second level aggregation for the night graph
   saveTimer: null,
-  calibrating: null,
-  onFrame: null,
   seg: null, segTimer: null,  // whole-night recording
 
   async start({ record = settings.recordAll } = {}) {
@@ -189,20 +174,19 @@ const WebMonitor = {
     this.analyser.fftSize = 2048;
     this.src.connect(this.analyser);
     this.proc.onaudioprocess = (e) => this.process(e.inputBuffer.getChannelData(0), this.ctx.sampleRate);
+    // iPhone: a call, Siri or another app can suspend audio; resume as soon as possible
+    this.ctx.onstatechange = () => { if (this.running && this.ctx.state !== 'running') this.ctx.resume().catch(() => {}); };
 
     const now = Date.now();
     this.session = {
       id: 's' + now, start: now, end: now,
       settings: { ...settings },
-      levels: [],      // one value per second: max dB in that second
-      events: [],      // breathing pauses
+      levels: [],      // one value per second: max dB in that second (0 = no data)
+      events: [],      // (kept for older app versions)
       clips: [],       // { id, start, duration, peak, tag } (audio is in the clips store)
       segments: [],    // whole-night recording: { id, start, duration, mime, size } (audio in segments store)
     };
-    Object.assign(this, {
-      floor: null, preBuf: [], preLen: 0, clip: null, lastActive: now, wasActive: false, inactiveSince: now,
-      bursts: [], silence: null, pendingResume: null, secMax: 0, secStart: now, live: [],
-    });
+    Object.assign(this, { preBuf: [], preLen: 0, clip: null, secMax: 0, secStart: now });
     this.running = true;
     await DB.putSession(this.session);
     this.saveTimer = setInterval(() => this.persist(), 30000);
@@ -299,28 +283,17 @@ const WebMonitor = {
     const level = toDb(Math.sqrt(sum / input.length));
     this.level = level;
 
-    // noise floor: drops quickly, rises very slowly (follows the quiet room, not breathing)
-    if (this.floor === null) this.floor = level;
-    else if (level < this.floor) this.floor += (level - this.floor) * 0.3;
-    else this.floor += (level - this.floor) * 0.0005;
-
-    if (this.calibrating) { this.calibrating.push(level); }
-
-    // live chart + per-second history
-    this.live.push(level);
-    const frameSec = input.length / rate;
-    const maxLive = Math.ceil(LIVE_SECONDS / frameSec);
-    if (this.live.length > maxLive) this.live.splice(0, this.live.length - maxLive);
+    // per-second maximum for the night graph; seconds with no audio (browser stalled) are stored as 0
     this.secMax = Math.max(this.secMax, level);
-    while (now - this.secStart >= 1000) {
-      this.session.levels.push(Math.round(this.secMax * 10) / 10);
-      this.secMax = level; this.secStart += 1000;
+    if (now - this.secStart >= 1000) {
+      const lv = this.session.levels;
+      lv.push(Math.round(this.secMax * 10) / 10);
+      this.secStart += 1000;
+      while (now - this.secStart >= 1000) { lv.push(0); this.secStart += 1000; }
+      this.secMax = level;
     }
 
-    const chunk = resample(input, rate, CLIP_RATE);
-    this.handleClip(chunk, level, now);
-    this.handleBreathing(level, now);
-    if (this.onFrame) this.onFrame();
+    this.handleClip(resample(input, rate, CLIP_RATE), level, now);
   },
 
   // ---- threshold-triggered clip recording with pre-roll
@@ -367,69 +340,13 @@ const WebMonitor = {
       })
       .then(() => DB.putSession(session).catch(() => {}));
   },
-
-  // ---- breathing pause detection
-  handleBreathing(level, now) {
-    const s = settings;
-    const active = level >= this.floor + s.breathMargin;
-
-    // count breath/snore onsets (sound after ≥0.7 s of quiet)
-    if (active && !this.wasActive && now - this.inactiveSince >= 700) this.bursts.push(now);
-    if (!active && this.wasActive) this.inactiveSince = now;
-    this.wasActive = active;
-    while (this.bursts.length && now - this.bursts[0] > 180000) this.bursts.shift();
-
-    if (active) {
-      if (this.silence) {
-        const gap = (now - this.silence.start) / 1000;
-        if (gap >= s.apneaGap && gap <= s.apneaMax && this.silence.breaths >= s.minBreaths) {
-          const ev = { start: Math.round(this.silence.start), end: now, duration: +gap.toFixed(1), loudResume: false };
-          this.session.events.push(ev);
-          this.pendingResume = { ev, until: now + 3000 };
-          if (s.clipPauses && !this.clip) {
-            this.startClip(now, 'after pause');
-          } else if (this.clip && this.clip.tag === 'loud') {
-            this.clip.tag = 'after pause';
-          }
-          this.persist();
-        }
-        this.silence = null;
-      }
-      this.lastActive = now;
-    } else if (!this.silence && now - this.lastActive > 1500) {
-      const start = this.lastActive;
-      const breaths = this.bursts.filter((t) => t <= start && start - t <= 60000).length;
-      this.silence = { start, breaths };
-    }
-
-    if (this.pendingResume) {
-      if (level >= s.threshold) { this.pendingResume.ev.loudResume = true; this.pendingResume = null; }
-      else if (now > this.pendingResume.until) this.pendingResume = null;
-    }
-  },
-
-  discard(id) { return DB.deleteSession(id); },
-
-  calibrate(seconds = 10) {
-    return new Promise((resolve) => {
-      this.calibrating = [];
-      setTimeout(() => {
-        const vals = this.calibrating.sort((a, b) => a - b);
-        this.calibrating = null;
-        if (!vals.length) return resolve(null);
-        const p90 = vals[Math.floor(vals.length * 0.9)];
-        resolve(Math.round(p90 + 15));
-      }, seconds * 1000);
-    });
-  },
 };
 
 // ---------------------------------------------------------------- native monitor (Android app)
 // Same interface as WebMonitor, but the work happens in the native SleepService; this only polls its status.
 const NativeMonitor = {
   native: true,
-  running: false, level: 0, floor: null, session: null, clip: false, silence: false, seg: false,
-  live: [], frameSec: 0.064, bytes: 0, calibrating: null, onFrame: null, pollTimer: null,
+  running: false, level: 0, session: null, clip: false, seg: false, bytes: 0, pollTimer: null,
 
   async start({ record = settings.recordAll } = {}) {
     const st = await SR.start({ settings: { ...settings, recordAll: !!record } });
@@ -442,7 +359,7 @@ const NativeMonitor = {
     const r = await SR.stop();
     this.apply({ running: false });
     const s = r.session;
-    return s ? { id: s.id, start: s.start, end: s.end, clips: { length: s.clipCount }, events: { length: s.eventCount } } : null;
+    return s ? { id: s.id, start: s.start, end: s.end, clips: { length: s.clipCount } } : null;
   },
   // re-attach to a service that kept running while the app was closed or in the background
   async resume() {
@@ -465,12 +382,9 @@ const NativeMonitor = {
   },
   apply(st) {
     this.running = !!st.running;
-    if (!st.running) { this.session = null; this.clip = false; this.silence = false; this.seg = false; return; }
-    this.level = st.level; this.floor = st.floor; this.clip = st.clipActive; this.silence = st.silent;
-    this.seg = st.recordAll; this.bytes = st.fullBytes; this.live = st.live || []; this.frameSec = st.frameSec || 0.064;
-    this.session = { id: st.sessionId, start: st.start, clips: { length: st.clipCount }, events: { length: st.eventCount } };
-    if (this.calibrating) this.calibrating.push(st.level);
-    if (this.onFrame) this.onFrame();
+    if (!st.running) { this.session = null; this.clip = false; this.seg = false; return; }
+    this.level = st.level; this.clip = st.clipActive; this.seg = st.recordAll; this.bytes = st.fullBytes;
+    this.session = { id: st.sessionId, start: st.start, clips: { length: st.clipCount } };
   },
   fullBytes() { return this.bytes; },
   setRecordAll(on) {
@@ -478,8 +392,6 @@ const NativeMonitor = {
     return Promise.resolve();
   },
   persist() {},
-  discard(id) { return SR.deleteSession({ id }); },
-  calibrate: WebMonitor.calibrate,
 };
 
 const Monitor = USE_NATIVE ? NativeMonitor : WebMonitor;
@@ -537,14 +449,17 @@ function setupCanvas(cv) {
   g.clearRect(0, 0, w, h);
   return { g, w, h };
 }
-const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+// theme colors, read once (getComputedStyle is too slow to call every frame)
+const COLORS = {};
+const css = (v) => COLORS[v] || (COLORS[v] = getComputedStyle(document.documentElement).getPropertyValue(v).trim());
 const DB_MIN = 20, DB_MAX = 100;
 const yOf = (db, h) => h - ((Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / (DB_MAX - DB_MIN)) * h;
 
 // ---------------------------------------------------------------- live level preview
-// The meter and graph work as soon as the app opens (before Start). Nothing is recorded in preview.
+// The meter works as soon as the app opens (before Start). Nothing is recorded: the microphone only feeds
+// an analyser that the meter reads every screen frame.
 const Preview = {
-  on: false, level: 0, floor: null, live: [], frameSec: 0.085, onFrame: null, starting: null,
+  on: false, starting: null,
   start() {
     if (this.on || this.starting || Monitor.running || document.visibilityState !== 'visible') return this.starting || Promise.resolve();
     this.starting = (async () => {
@@ -555,16 +470,10 @@ const Preview = {
       const AC = window.AudioContext || window.webkitAudioContext;
       const ctx = new AC();
       const src = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(4096, 1, 1);
-      const sink = ctx.createGain();
-      sink.gain.value = 0;
-      src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
       src.connect(analyser);
-      this.analyser = analyser;
-      proc.onaudioprocess = (e) => this.process(e.inputBuffer.getChannelData(0));
-      Object.assign(this, { ctx, stream, src, proc, sink, on: true, live: [], floor: null, frameSec: 4096 / ctx.sampleRate });
+      Object.assign(this, { ctx, stream, src, analyser, on: true });
       if (ctx.state === 'suspended') {
         // browsers only allow audio after a tap
         ctx.resume().catch(() => {});
@@ -577,22 +486,9 @@ const Preview = {
   stop() {
     if (!this.on) return;
     this.on = false;
-    try { this.proc.disconnect(); this.src.disconnect(); this.sink.disconnect(); } catch {}
+    try { this.src.disconnect(); } catch {}
     this.stream.getTracks().forEach((t) => t.stop());
     this.ctx.close().catch(() => {});
-  },
-  process(input) {
-    let sum = 0;
-    for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
-    const level = toDb(Math.sqrt(sum / input.length));
-    this.level = level;
-    if (this.floor === null) this.floor = level;
-    else if (level < this.floor) this.floor += (level - this.floor) * 0.3;
-    else this.floor += (level - this.floor) * 0.0005;
-    this.live.push(level);
-    const max = Math.ceil(LIVE_SECONDS / this.frameSec);
-    if (this.live.length > max) this.live.splice(0, this.live.length - max);
-    if (this.onFrame) this.onFrame();
   },
 };
 
@@ -627,7 +523,7 @@ const levelSource = () => (Monitor.running ? Monitor : Preview);
 // In the browser the level is read straight from the microphone each frame; in the Android app the
 // background recorder's level (polled ~8x/s) is eased so it moves smoothly.
 const Meter = {
-  shown: null, hist: [], lastPush: 0, buf: null, lastText: 0,
+  shown: null, raw: null, hist: [], h0: 0, lastPush: 0, buf: null, lastText: 0, lastStatus: 0, barW: '',
   target(m) {
     if (!(Monitor.running || Preview.on)) return null;
     const an = m.analyser;
@@ -640,77 +536,79 @@ const Meter = {
     }
     return Number.isFinite(m.level) ? m.level : null;
   },
-  frame(now) {
+  frame(now, draw) {
     const m = levelSource(), t = this.target(m);
+    this.raw = t;
     if (t !== null) {
       // rise quickly, fall gently
       this.shown = this.shown === null ? t : this.shown + (t - this.shown) * (t > this.shown ? 0.5 : 0.12);
-      if (now - this.lastPush >= 33) { this.hist.push([now, this.shown]); this.lastPush = now; }
+      if (now - this.lastPush >= 33) { this.hist.push(now, this.shown); this.lastPush = now; }
     }
-    while (this.hist.length && now - this.hist[0][0] > LIVE_SECONDS * 1000) this.hist.shift();
+    // drop points older than the window (in batches: shifting a big array every frame is slow)
+    while (this.h0 < this.hist.length && now - this.hist[this.h0] > LIVE_SECONDS * 1000) this.h0 += 2;
+    if (this.h0 > 600) { this.hist.splice(0, this.h0); this.h0 = 0; }
+    if (now - this.lastStatus > 150) { this.lastStatus = now; updateStatus(); }
+    if (!draw) return;
     const v = this.shown;
     if (v !== null) {
       if (now - this.lastText > 150) { $('levelNow').textContent = Math.round(v); this.lastText = now; }
-      $('meterBar').style.width = `${((Math.min(DB_MAX, Math.max(DB_MIN, v)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
+      const bw = `${(((Math.min(DB_MAX, Math.max(DB_MIN, v)) - DB_MIN) / (DB_MAX - DB_MIN)) * 100).toFixed(1)}%`;
+      if (bw !== this.barW) { $('meterBar').style.width = bw; this.barW = bw; }
     }
-    if (m.floor !== null && m.floor !== undefined) {
-      $('meterFloor').style.left = `${((Math.max(DB_MIN, m.floor + settings.breathMargin) - DB_MIN) / (DB_MAX - DB_MIN)) * 100}%`;
-    }
-    this.draw(now, m);
+    this.draw(now);
   },
-  draw(now = performance.now(), m = levelSource()) {
+  draw(now = performance.now()) {
     const { g, w, h } = setupCanvas($('liveChart'));
     g.strokeStyle = css('--danger'); g.setLineDash([4, 4]); g.lineWidth = 1; g.beginPath();
     const ty = yOf(settings.threshold, h); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke(); g.setLineDash([]);
-    if (m.floor !== null && m.floor !== undefined) {
-      g.strokeStyle = css('--muted'); g.globalAlpha = 0.5; g.beginPath();
-      const fy = yOf(m.floor + settings.breathMargin, h); g.moveTo(0, fy); g.lineTo(w, fy); g.stroke(); g.globalAlpha = 1;
-    }
-    if (!this.hist.length) return;
+    const pts = this.hist, i0 = this.h0;
+    if (pts.length - i0 < 4) return;
     // scrolls continuously: x is based on time, not on sample count
-    const span = LIVE_SECONDS * 1000, pts = this.hist;
+    const span = LIVE_SECONDS * 1000;
     g.beginPath();
-    pts.forEach(([t, lv], i) => { const x = w - ((now - t) / span) * w, y = yOf(lv, h); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    for (let i = i0; i < pts.length; i += 2) {
+      const x = w - ((now - pts[i]) / span) * w, y = yOf(pts[i + 1], h);
+      if (i === i0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
     g.strokeStyle = Monitor.running ? css('--accent') : css('--muted'); g.lineWidth = 1.5; g.lineJoin = 'round';
     g.stroke();
     // soft fill under the line
-    g.lineTo(w, h); g.lineTo(w - ((now - pts[0][0]) / span) * w, h); g.closePath();
+    g.lineTo(w, h); g.lineTo(w - ((now - pts[i0]) / span) * w, h); g.closePath();
     g.fillStyle = Monitor.running ? 'rgba(143,180,255,.14)' : 'rgba(138,148,168,.10)';
     g.fill();
   },
   start() {
     const step = (now) => {
       requestAnimationFrame(step);
-      if (document.visibilityState !== 'visible' || !$('nightOverlay').hidden || !$('nightSheet').hidden) return;
-      this.frame(now);
+      if (document.visibilityState !== 'visible') return;
+      // the graph is hidden behind night mode or an open night: keep the status, skip drawing
+      this.frame(now, $('nightOverlay').hidden && $('nightSheet').hidden);
     };
     requestAnimationFrame(step);
   },
 };
 const drawLive = () => Meter.draw();
 
-let lastUi = 0, calib = null, lastSaved = '';
-function onLevelFrame() {
-  const now = performance.now();
-  if (now - lastUi < 100) return;
-  lastUi = now;
-  const m = levelSource(), s = Monitor.running ? Monitor.session : null;
-  if (calib) calib.push(m.level);
+let calib = null, lastSaved = '';
+function updateStatus() {
+  const s = Monitor.running ? Monitor.session : null;
+  if (calib && Meter.raw !== null) calib.push(Meter.raw);
   let state, info;
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
-    state = Monitor.clip ? '● Recording sound' : Monitor.silence ? 'Quiet' : 'Monitoring';
-    const el = Date.now() - s.start;
-    info = `${fmtDur(el)} · ${s.events.length} pauses · ${s.clips.length} clips` ;
-    $('nightInfo').textContent = `${s.clips.length} clips · ${s.events.length} pauses`;
-  } else { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
-  $('stState').textContent = state;
+    state = Monitor.clip ? '● Recording sound' : 'Monitoring';
+    info = `${fmtDur(Date.now() - s.start)} · ${s.clips.length} loud sounds`;
+    setText('nightInfo', `${s.clips.length} loud sounds`);
+  } else if (Preview.on || Preview.starting) { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
+  else return; // keep the "microphone blocked" message
+  setText('stState', state);
   $('stState').style.color = s && Monitor.clip ? css('--danger') : '';
-  $('stInfo').textContent = info;
+  setText('stInfo', info);
   updateRecordAllInfo();
 }
-Monitor.onFrame = onLevelFrame;
-Preview.onFrame = onLevelFrame;
+// only touch the DOM when the text actually changes
+function setText(id, text) { setTextEl($(id), text); }
+function setTextEl(el, text) { if (el && el.textContent !== text) el.textContent = text; }
 
 function setRunningUI(on) {
   const b = $('btnToggle');
@@ -743,9 +641,10 @@ $('btnToggle').onclick = async () => {
       try { s = await Monitor.stop(); } catch (e) { alert('Stop failed: ' + e.message); }
       setRunningUI(false);
       allowSleep();
-      if (s) lastSaved = `Saved ${fmtDur(s.end - s.start)} · ${s.events.length} pauses · ${s.clips.length} clips`;
+      if (s) lastSaved = `Saved ${fmtDur(s.end - s.start)} · ${s.clips.length} loud sounds`;
       startPreview();
-      renderWeek();
+      await renderWeek();
+      autoRecognise();
     }
   } finally {
     b.disabled = false;
@@ -753,10 +652,11 @@ $('btnToggle').onclick = async () => {
 };
 
 // monitoring was stopped from the notification's Stop button
-function onStoppedElsewhere() {
+async function onStoppedElsewhere() {
   setRunningUI(false);
   startPreview();
-  renderWeek();
+  await renderWeek();
+  autoRecognise();
 }
 
 $('btnCalibrate').onclick = async () => {
@@ -764,6 +664,7 @@ $('btnCalibrate').onclick = async () => {
   if (!Monitor.running && !Preview.on) {
     try { await Preview.start(); } catch (e) { alert('Microphone error: ' + e.message); return; }
   }
+  if (Preview.ctx && Preview.ctx.state !== 'running') await Preview.ctx.resume().catch(() => {});
   calib = [];
   await new Promise((r) => setTimeout(r, 10000));
   const vals = calib.sort((a, b) => a - b);
@@ -848,11 +749,9 @@ async function updateStorageInfo() {
 // ---------------------------------------------------------------- settings
 const FIELDS = {
   setThreshold: 'threshold', setPreRoll: 'preRoll', setPostRoll: 'postRoll', setMaxClip: 'maxClip',
-  setApneaGap: 'apneaGap', setApneaMax: 'apneaMax', setBreathMargin: 'breathMargin', setMinBreaths: 'minBreaths',
 };
 function fillSettings() {
   for (const [id, key] of Object.entries(FIELDS)) $(id).value = settings[key];
-  $('setClipPauses').checked = settings.clipPauses;
   $('recordAll').checked = settings.recordAll;
   $('recordAll').disabled = !FULL_OK;
   updateRecordAllInfo();
@@ -866,7 +765,6 @@ for (const [id, key] of Object.entries(FIELDS)) {
     saveSettings(); updateThresholdUI();
   });
 }
-$('setClipPauses').onchange = (e) => { settings.clipPauses = e.target.checked; saveSettings(); };
 $('btnResetSettings').onclick = () => { settings = { ...DEFAULTS, recordAll: true }; saveSettings(); Monitor.setRecordAll(settings.recordAll); fillSettings(); };
 
 // ---------------------------------------------------------------- history UI
@@ -931,105 +829,84 @@ async function mountNight(el, src) {
   const meta = () => {
     const s = view.s;
     const dur = (live ? Date.now() : s.end) - s.start;
-    const longest = s.events.reduce((m, e) => Math.max(m, e.duration), 0);
-    return `${fmtDur(dur)} · ${s.events.length} pauses (${rate(s.events.length, dur)}/h)` +
-      (longest ? ` · longest ${longest}s` : '') + (view.segs.length ? ` · full ${fmtMB(segBytes(s))}` : '');
+    const snore = snoreMs(s);
+    return `${fmtDur(dur)} · ${view.sounds.length} loud sounds` +
+      (snore !== null ? ` · snoring ${fmtSnore(snore)}` : '') + (view.segs.length ? ` · ${fmtMB(segBytes(s))}` : '');
   };
   let d;
   try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return null; }
+  if (!el.isConnected) return null; // closed while loading
   view = new NightView(el, d.s, d.clips, d.segs, src);
   openViews.add(view);
 
   const renderSummary = () => {
-    el.querySelector('.s-meta').textContent = meta();
-    el.querySelector('.n-ev').textContent = view.s.events.length;
-    el.querySelector('.n-cl').textContent = view.soundList().length;
+    setTextEl(el.querySelector('.s-meta'), meta());
+    setTextEl(el.querySelector('.n-cl'), String(view.soundList().length));
     el.querySelector('.btn-dlfull').hidden = !view.segs.length;
     el.querySelector('.btn-delfull').hidden = !view.segs.length || live;
   };
 
-  // breathing pauses: tap to zoom the graph there and play the sound
-  const evBox = el.querySelector('.s-events');
-  const renderEvents = () => {
-    const s = view.s;
-    evBox.innerHTML = s.events.length ? '' : '<p class="muted empty">No breathing pauses detected.</p>';
-    s.events.forEach((e) => {
-      const d = document.createElement('div');
-      d.className = 'list-item clickable';
-      d.innerHTML = `<span>${fmtTime(e.start)}</span><b>${e.duration}s</b>` +
-        (e.loudResume ? '<span class="tag">gasp</span>' : '') + '<span class="grow"></span><span class="muted">▶</span>';
-      d.onclick = () => view.focusEvent(e);
-      evBox.appendChild(d);
-    });
-  };
-
   // sounds above this night's threshold, labelled by what they are; tap to play
   const sndBox = el.querySelector('.s-sounds'), chipBox = el.querySelector('.cat-chips');
+  let shown = [];
   const renderSounds = () => {
-    const list = view.soundList();
-    sndBox.innerHTML = list.length ? '' : `<p class="muted empty">No ${view.cat ? CATS[view.cat].name.toLowerCase() + ' ' : ''}sounds above ${view.thr} dB.</p>`;
-    list.forEach((x) => {
-      const d = document.createElement('div');
-      d.className = 'list-item clickable snd-row';
+    shown = view.soundList();
+    sndBox.innerHTML = shown.length ? shown.map((x, i) => {
       const cat = x.c ? CATS[x.c] : null;
-      d.innerHTML = `<span>${fmtTime(x.s)}</span><span>${Math.round((x.e - x.s) / 1000)}s</span><span class="muted">${Math.round(x.peak)} dB</span>` +
-        (cat ? `<span class="cat" style="--c:${cat.color}">${cat.name}</span>` : '') + '<span class="grow"></span><span class="muted">▶</span>';
-      d.onclick = () => view.playSound(x);
-      sndBox.appendChild(d);
-    });
+      return `<div class="list-item clickable snd-row" data-i="${i}"><span>${fmtTime(x.s)}</span><span>${Math.round((x.e - x.s) / 1000)}s</span>` +
+        `<span class="muted">${Math.round(x.peak)} dB</span>${cat ? `<span class="cat" style="--c:${cat.color}">${cat.name}</span>` : ''}` +
+        '<span class="grow"></span><span class="muted">▶</span></div>';
+    }).join('') : `<p class="muted empty">No ${view.cat ? CATS[view.cat].name.toLowerCase() + ' ' : ''}sounds above ${view.thr} dB.</p>`;
     view.rowMark = null;
     view.markRows();
   };
-  // category chips: how much of each kind of sound was heard; tap to highlight it
-  const renderChips = () => {
-    const runs = view.runs();
-    chipBox.innerHTML = '';
-    if (!runs.length) return;
-    const secs = {};
-    runs.forEach((r) => { secs[r.c] = (secs[r.c] || 0) + (r.e - r.s) / 1000; });
-    CAT_ORDER.filter((c) => secs[c]).forEach((c) => {
-      const b = document.createElement('button');
-      const n = view.sounds.filter((x) => x.c === c).length;
-      const m = Math.round(secs[c] / 60);
-      b.className = 'chip' + (view.cat === c ? ' on' : '');
-      b.style.setProperty('--c', CATS[c].color);
-      b.innerHTML = `${CATS[c].name} <span>${m ? m + 'm' : Math.round(secs[c]) + 's'}${n ? ' · ' + n : ''}</span>`;
-      b.onclick = () => view.setCategory(c);
-      chipBox.appendChild(b);
-    });
-  };
+  sndBox.onclick = (e) => { const r = e.target.closest('.snd-row'); if (r) view.playSound(shown[+r.dataset.i]); };
 
-  // threshold for this night: changes which sounds count as loud
+  // category chips: how long each kind of sound was heard and how many loud sounds it caused; tap to highlight
+  const renderChips = () => {
+    const runs = view.runs(), secs = {}, count = {};
+    runs.forEach((r) => { secs[r.c] = (secs[r.c] || 0) + (r.e - r.s) / 1000; });
+    view.sounds.forEach((x) => { if (x.c) count[x.c] = (count[x.c] || 0) + 1; });
+    chipBox.innerHTML = CAT_ORDER.filter((c) => secs[c]).map((c) => {
+      const m = Math.round(secs[c] / 60), n = count[c];
+      return `<button class="chip${view.cat === c ? ' on' : ''}" data-c="${c}" style="--c:${CATS[c].color}">${CATS[c].name} ` +
+        `<span>${m ? m + 'm' : Math.round(secs[c]) + 's'}${n ? ' · ' + n : ''}</span></button>`;
+    }).join('');
+  };
+  chipBox.onclick = (e) => { const b = e.target.closest('.chip'); if (b) view.setCategory(b.dataset.c); };
+
+  // threshold for this night: changes which sounds count as loud (applied at most once per frame)
   const thrIn = el.querySelector('.thr-in'), thrV = el.querySelector('.thr-v');
   thrIn.value = view.thr; thrV.textContent = view.thr;
-  thrIn.oninput = () => { thrV.textContent = thrIn.value; view.setThreshold(+thrIn.value); };
+  let thrQueued = false;
+  thrIn.oninput = () => {
+    thrV.textContent = thrIn.value;
+    if (thrQueued) return;
+    thrQueued = true;
+    requestAnimationFrame(() => { thrQueued = false; view.setThreshold(+thrIn.value); });
+  };
 
-  view.onDataChanged = () => { renderSounds(); renderChips(); renderEvents(); renderSummary(); };
+  view.onDataChanged = () => { renderSounds(); renderChips(); renderSummary(); };
   view.onDataChanged();
 
-  // recognise the sounds of this night once (saved with the night)
+  // sound recognition runs as a background job (keeps going if this night is closed)
   const status = el.querySelector('.an-status');
-  const runAnalysis = async () => {
-    const items = view.segs.length ? view.segs : view.clips;
-    if (live || !items.length) { status.textContent = live ? 'after the night' : ''; return; }
-    if (view.s.analysis && view.s.analysis.v === ANALYSIS_VERSION) { status.textContent = ''; return; }
-    status.textContent = 'recognising…';
-    try {
-      const res = await Analyzer.analyze(items, (f) => { status.textContent = `recognising ${Math.round(f * 100)}%`; }, () => view.cancelled);
-      if (!res || view.cancelled) return;
-      view.s.analysis = res;
-      await src.saveAnalysis(res).catch((e) => console.warn('analysis not saved', e));
-      status.textContent = '';
-      view.recalc();
-      view.onDataChanged();
-      view.draw();
-    } catch (e) {
-      console.warn('recognition failed', e);
-      status.textContent = 'recognition unavailable';
-      status.title = String(e && e.message || e);
+  const showJob = (job) => {
+    if (job.error) { status.textContent = 'recognition unavailable'; status.title = String(job.error.message || job.error); return; }
+    if (!job.done) { setTextEl(status, `recognising ${Math.round(job.progress * 100)}%`); return; }
+    status.textContent = '';
+    if (job.result && view.root.isConnected) {
+      view.s.analysis = job.result;
+      view.recalc(); view.onDataChanged(); view.requestDraw();
     }
   };
-  runAnalysis();
+  if (live) status.textContent = 'after the night';
+  else if (Recog.needs(view.s) && (view.segs.length || view.clips.length)) {
+    const job = Recog.run(src, d);
+    job.listeners.add(showJob);
+    view.onDestroy = () => job.listeners.delete(showJob);
+    showJob(job);
+  }
 
   // actions live in the ⋮ menu of the night screen
   const actions = el.querySelector('.s-actions');
@@ -1040,7 +917,6 @@ async function mountNight(el, src) {
   el.querySelector('.btn-csv').onclick = () => {
     const s = view.s;
     const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
-    s.events.forEach((e) => rows.push(['pause', new Date(e.start).toISOString(), new Date(e.end).toISOString(), e.duration, '', e.loudResume ? 'loud resume' : '']));
     view.clips.forEach((c) => rows.push(['clip', new Date(c.start).toISOString(), new Date(c.start + c.duration * 1000).toISOString(), c.duration, c.peak, c.tag]));
     download(new Blob([rows.map((r) => r.join(',')).join('\n')], { type: 'text/csv' }), `sleep_${fileStamp(s.start)}.csv`);
   };
@@ -1093,7 +969,12 @@ const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); r
 const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const durShort = (ms) => { const m = Math.round(ms / 60000); return m >= 60 ? `${Math.floor(m / 60)}h${pad(m % 60)}` : `${m}m`; };
 const nightEnd = (src) => (src.live ? Date.now() : src.s.end);
-const rateClass = (r) => (r < 5 ? 'r1' : r < 15 ? 'r2' : r < 30 ? 'r3' : 'r4');
+// snoring recognised in a night, in ms (null = not analysed yet)
+function snoreMs(s) {
+  if (!s.analysis || !s.analysis.runs) return null;
+  return s.analysis.runs.reduce((t, r) => t + (r.c === 'snore' ? r.e - r.s : 0), 0);
+}
+const fmtSnore = (ms) => (ms > 0 && ms < 60000 ? '<1m' : durShort(ms));
 
 function sparkOf(s) {
   if (s.spark) return s.spark;
@@ -1117,13 +998,16 @@ function drawSpark(cv, src) {
       g.fillRect(i * bw, y, Math.max(1, bw - 0.5), h - y);
     });
   }
-  // breathing pauses: short ticks along the top
-  g.fillStyle = css('--warn');
-  (s.events || []).forEach((e) => g.fillRect(((e.start - s.start) / total) * w, 0, 1, Math.max(3, h * 0.18)));
+  // snoring (once recognised): short ticks along the top
+  g.fillStyle = CATS.snore.color;
+  ((s.analysis && s.analysis.runs) || []).forEach((r) => { if (r.c === 'snore') g.fillRect(((r.s - s.start) / total) * w, 0, Math.max(1, ((r.e - r.s) / total) * w), Math.max(3, h * 0.18)); });
 }
 
+let renderSeq = 0;
 async function renderWeek(reload = true) {
+  const seq = ++renderSeq;
   if (reload) await loadNights();
+  if (seq !== renderSeq) return; // a newer refresh started meanwhile
   const ws = weekStart(weekOffset), we = addDays(ws, 7);
   const fmtD = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric' });
   $('weekLabel').textContent = weekOffset === 0 ? `This week · ${fmtD(ws)} – ${fmtD(addDays(ws, 6))}`
@@ -1146,11 +1030,10 @@ async function renderWeek(reload = true) {
     let html = `<div class="t-day"><span>${label}</span>` +
       (list.some((n) => n.live) ? '<span class="badge">REC</span>' : list.length > 1 ? `<span class="more">+${list.length - 1}</span>` : '') + '</div>';
     if (main) {
-      const dur = nightEnd(main) - main.s.start, n = main.s.events.length;
-      const r = dur >= 600000 ? n / (dur / 3600e3) : null;
+      const dur = nightEnd(main) - main.s.start, sn = snoreMs(main.s);
       html += `<div class="t-time">${hm(main.s.start)}</div><canvas></canvas>` +
         `<div class="t-time">${durShort(dur)}</div>` +
-        `<div class="t-rate ${r === null ? '' : rateClass(r)}">${r === null ? '–' : `${r.toFixed(1)}/h`}</div>`;
+        `<div class="t-rate snore" data-night="${main.s.id}">${sn === null ? '' : sn ? `snore ${fmtSnore(sn)}` : 'no snoring'}</div>`;
       el.onclick = () => openNight(list, list.indexOf(main));
     } else {
       html += `<div class="t-time">${day > today ? '' : '—'}</div>`;
@@ -1164,16 +1047,26 @@ async function renderWeek(reload = true) {
   const sum = document.createElement('div');
   sum.className = 'tile summary';
   const hours = inWeek.reduce((t, n) => t + (nightEnd(n) - n.s.start), 0) / 3600e3;
-  const pauses = inWeek.reduce((t, n) => t + n.s.events.length, 0);
   const nights = new Set(inWeek.map((n) => nightDay(n.s.start))).size;
-  const avg = hours >= 1 / 6 ? pauses / hours : null;
+  const analysed = inWeek.filter((n) => snoreMs(n.s) !== null);
+  const snoreAvg = analysed.length ? analysed.reduce((t, n) => t + snoreMs(n.s), 0) / analysed.length : null;
   sum.innerHTML = `<div class="t-day"><span>Week</span></div>` +
     `<div><b>${nights}</b> night${nights === 1 ? '' : 's'}</div>` +
     `<div class="muted">${hours ? `${(hours / Math.max(1, nights)).toFixed(1)} h avg` : '—'}</div>` +
-    `<div class="t-time">pauses/h</div>` +
-    `<div class="t-rate ${avg === null ? '' : rateClass(avg)}"><b>${avg === null ? '–' : avg.toFixed(1)}</b></div>`;
+    `<div class="t-time">snoring avg</div>` +
+    `<div class="t-rate snore"><b>${snoreAvg === null ? '–' : fmtSnore(snoreAvg)}</b></div>`;
   grid.appendChild(sum);
   requestAnimationFrame(() => sparks.forEach(([cv, src]) => drawSpark(cv, src)));
+  grid.querySelectorAll('[data-night]').forEach((el) => {
+    const job = Recog.jobs.get(el.dataset.night);
+    if (!job) return;
+    const f = (j) => {
+      if (!el.isConnected) { j.listeners.delete(f); return; }
+      if (j.done) { j.listeners.delete(f); renderWeek(false); return; }
+      setTextEl(el, `recognising ${Math.round(j.progress * 100)}%`);
+    };
+    job.listeners.add(f); f(job);
+  });
 }
 
 $('weekPrev').onclick = () => { weekOffset--; renderWeek(false); };
@@ -1191,7 +1084,8 @@ $('weekNext').onclick = () => { if (weekOffset < 0) { weekOffset++; renderWeek(f
     if (dx < 0 && !$('weekNext').disabled) $('weekNext').click();
   });
 })();
-window.addEventListener('resize', () => renderWeek(false));
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderWeek(false), 150); });
 
 // ---------------------------------------------------------------- one night (full screen)
 function closeNight() {
@@ -1336,6 +1230,41 @@ const Analyzer = {
   },
 };
 
+// Background recognition: one night at a time; progress can be shown by the night view and the week grid.
+const Recog = {
+  jobs: new Map(),          // night id -> { progress, done, result, error, listeners }
+  queue: Promise.resolve(),
+  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION),
+  run(src, loaded) {
+    const id = src.s.id;
+    if (this.jobs.has(id)) return this.jobs.get(id);
+    const job = { progress: 0, done: false, result: null, error: null, listeners: new Set() };
+    const notify = () => job.listeners.forEach((f) => { try { f(job); } catch (e) { console.warn(e); } });
+    this.jobs.set(id, job);
+    this.queue = this.queue.catch(() => {}).then(async () => {
+      const d = loaded || await src.load();
+      const items = d.segs.length ? d.segs : d.clips;
+      const res = items.length ? await Analyzer.analyze(items, (f) => { job.progress = f; notify(); }, () => false) : null;
+      if (res) {
+        await src.saveAnalysis(res).catch((e) => console.warn('analysis not saved', e));
+        src.s.analysis = res;
+      }
+      job.result = res;
+    }).catch((e) => { console.warn('recognition failed', e); job.error = e; })
+      .finally(() => { job.done = true; notify(); this.jobs.delete(id); });
+    return job;
+  },
+};
+
+// After a night ends, recognise its sounds in the background (newest unanalysed night of the last 3 days)
+function autoRecognise() {
+  if (Monitor.running) return; // don't compete with a recording
+  const cand = allNights
+    .filter((n) => !n.live && Recog.needs(n.s) && Date.now() - n.s.start < 3 * 864e5 && ((n.s.segments || []).length || (n.s.clips || []).length))
+    .sort((a, b) => b.s.start - a.s.start)[0];
+  if (cand) { Recog.run(cand); renderWeek(false); }
+}
+
 // loud sounds = runs of seconds at or above the threshold (gaps up to 3 s are joined)
 function computeSounds(s, thr, runs) {
   const lv = s.levels || [], out = [];
@@ -1347,16 +1276,19 @@ function computeSounds(s, thr, runs) {
     else { if (cur) out.push(cur); cur = { s: t, e: t + 1000, peak: lv[i] }; }
   }
   if (cur) out.push(cur);
-  // label each sound with the category heard most during it
-  if (runs) {
+  // label each sound with the category heard most during it (runs are sorted: one pass)
+  if (runs && runs.length) {
+    let j = 0;
     for (const snd of out) {
-      const tally = {};
-      for (const r of runs) {
-        const ov = Math.min(r.e, snd.e + 1000) - Math.max(r.s, snd.s - 1000);
+      const a = snd.s - 1000, b = snd.e + 1000, tally = {};
+      while (j < runs.length && runs[j].e <= a) j++;
+      for (let k = j; k < runs.length && runs[k].s < b; k++) {
+        const r = runs[k], ov = Math.min(r.e, b) - Math.max(r.s, a);
         if (ov > 0) tally[r.c] = (tally[r.c] || 0) + ov * CAT_WEIGHT[r.c];
       }
-      const best = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
-      snd.c = best ? best[0] : null;
+      let best = null;
+      for (const c in tally) if (!best || tally[c] > tally[best]) best = c;
+      snd.c = best;
     }
   }
   return out;
@@ -1380,7 +1312,7 @@ class NightView {
     this.urls = new Map();
     this.mode = null; this.cur = -1; this.tok = 0; this.loadedId = null;
     this.fixing = false; this.pendingOffset = 0;
-    this.selEvent = null; this.raf = 0; this.rowMark = null;
+    this.raf = 0; this.rowMark = null;
     this.selSound = null;
     this.cat = null; // category filter (null = all)
     this.thr = +(lsGet('sleepmon.thr.' + s.id) || s.settings.threshold || 60);
@@ -1407,7 +1339,7 @@ class NightView {
 
     q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
     q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
-    q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.draw(); };
+    q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.requestDraw(); };
     this.ui.play.onclick = () => this.toggle();
     this.ui.prev.onclick = () => this.jump(-1);
     this.ui.next.onclick = () => this.jump(1);
@@ -1422,7 +1354,7 @@ class NightView {
     this.audio.addEventListener('timeupdate', () => this.updatePlayer());
 
     this.bindPointer();
-    this.onResize = () => { if (root.isConnected) this.draw(); };
+    this.onResize = () => this.requestDraw();
     window.addEventListener('resize', this.onResize);
     this.counts = this.countKey();
     if (this.live) {
@@ -1443,17 +1375,19 @@ class NightView {
   destroy() {
     this.pause();
     this.cancelled = true;
+    if (this.onDestroy) this.onDestroy();
     if (this.ac) this.ac.close().catch(() => {});
     window.removeEventListener('resize', this.onResize);
     clearInterval(this.liveTimer);
     this.urls.forEach((u) => URL.revokeObjectURL(u));
   }
 
-  countKey() { return [this.clips.length, this.segs.length, this.s.events.length, this.sounds.length].join(); }
+  countKey() { return [this.clips.length, this.segs.length, this.sounds.length, this.runs().length].join(); }
 
   // ---- threshold, sounds and categories
   recalc() {
     this.sounds = computeSounds(this.s, this.thr, this.s.analysis && this.s.analysis.runs);
+    this.version = (this.version || 0) + 1;
   }
   setThreshold(v) {
     this.thr = v;
@@ -1461,7 +1395,7 @@ class NightView {
     this.recalc();
     this.rowMark = null;
     if (this.onDataChanged) this.onDataChanged();
-    this.draw();
+    this.requestDraw();
   }
   setCategory(c) {
     this.cat = this.cat === c ? null : c;
@@ -1471,7 +1405,16 @@ class NightView {
   }
   soundList() { return this.cat ? this.sounds.filter((x) => x.c === this.cat) : this.sounds; }
   runs() { return (this.s.analysis && this.s.analysis.runs) || []; }
-  catAt(t) { const r = this.runs().find((x) => t >= x.s && t < x.e); return r || null; }
+  // run (recognised sound) at time t: binary search, runs are sorted and don't overlap
+  catAt(t) {
+    const rs = this.runs();
+    let lo = 0, hi = rs.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (rs[mid].e <= t) lo = mid + 1; else if (rs[mid].s > t) hi = mid - 1; else return rs[mid];
+    }
+    return null;
+  }
 
   // route playback through Web Audio so it can be amplified
   audioGraph() {
@@ -1521,7 +1464,7 @@ class NightView {
     const t1 = this.tEnd(), span = Math.min(v1 - v0, t1 - this.t0);
     v0 = Math.max(this.t0, Math.min(v0, t1 - span));
     this.v0 = v0; this.v1 = v0 + span;
-    this.draw();
+    this.requestDraw();
   }
 
   zoomAt(t, factor, base = [this.v0, this.v1]) {
@@ -1554,6 +1497,8 @@ class NightView {
     if (clipIdx >= 0) {
       const c = this.clips[clipIdx];
       this.playItem('clip', clipIdx, t >= c.start && t <= this.endOf(c) ? (t - c.start) / 1000 : 0);
+    } else {
+      this.ui.title.textContent = `No audio saved at ${fmtTime(t)}`;
     }
   }
 
@@ -1650,6 +1595,7 @@ class NightView {
     if (this.mode === 'seg') this.stopAudio();
     this.segs.forEach((g) => this.revoke(g.id));
     this.segs = [];
+    this.version++;
     this.updatePlayer(); this.draw();
   }
 
@@ -1693,15 +1639,17 @@ class NightView {
     }
     const at = this.pos(), t = this.curT();
     if (this.mode === 'seg') {
-      const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
       const r = this.catAt(t);
-      u.title.textContent = `${fmtTime(t)}` + (ev ? ' · breathing pause' : r ? ' · ' + (r.c === 'other' ? r.l : CATS[r.c].name) : '');
+      const title = `${fmtTime(t)}` + (r ? ' · ' + (r.c === 'other' ? r.l : CATS[r.c].name) : '');
+      if (u.title.textContent !== title) u.title.textContent = title;
     } else {
       u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(t)} · peak ${it.peak} dB` +
         (it.tag === 'after pause' ? ' · after pause' : '');
     }
-    u.seek.value = it.duration ? Math.round((at / it.duration) * 1000) : 0;
-    u.time.textContent = `${fmtClock(at)} / ${fmtClock(it.duration)}`;
+    const sv = String(it.duration ? Math.round((at / it.duration) * 1000) : 0);
+    if (u.seek.value !== sv && document.activeElement !== u.seek) u.seek.value = sv;
+    const tt = `${fmtClock(at)} / ${fmtClock(it.duration)}`;
+    if (u.time.textContent !== tt) u.time.textContent = tt;
   }
 
   loop() {
@@ -1717,24 +1665,6 @@ class NightView {
       this.raf = requestAnimationFrame(step);
     };
     this.raf = requestAnimationFrame(step);
-  }
-
-  focusEvent(e) {
-    this.selEvent = e;
-    const span = Math.max(120000, e.duration * 1000 * 5);
-    this.setView((e.start + e.end) / 2 - span / 2, (e.start + e.end) / 2 + span / 2);
-    if (this.segAt(e.start) >= 0) {
-      this.playAt(Math.max(e.start - 5000, this.t0)); // whole night: hear the last breaths, the silence and the restart
-    } else {
-      // play the sound when breathing restarted (or the closest clip around the pause)
-      let best = -1, bestD = Infinity;
-      this.clips.forEach((c, i) => {
-        if (c.start > e.end + 30000 || this.endOf(c) < e.start - 30000) return;
-        const d = Math.abs(c.start - e.end) - (c.tag === 'after pause' ? 5000 : 0);
-        if (d < bestD) { bestD = d; best = i; }
-      });
-      if (best >= 0) this.play(best, Math.max(0, (e.end - 5000 - this.clips[best].start) / 1000));
-    }
   }
 
   // ---- graph interaction
@@ -1801,10 +1731,8 @@ class NightView {
 
   showTip(x) {
     const t = this.tAt(x), lvl = this.levelAt(t);
-    const ev = this.s.events.find((e) => t >= e.start && t <= e.end);
     const ci = this.clipAt(x);
     let html = `${fmtTime(t)}${lvl !== null ? ` · ${Math.round(lvl)} dB` : ''}`;
-    if (ev) html += `<br>Breathing pause ${ev.duration}s`;
     const r = this.catAt(t);
     if (r) html += `<br><span style="color:${CATS[r.c].color}">● ${r.c === 'other' ? r.l : CATS[r.c].name}</span>`;
     if (this.segAt(t) >= 0) html += '<br><b>Tap to listen</b>';
@@ -1816,7 +1744,6 @@ class NightView {
 
   tap(x) {
     const t = this.tAt(x);
-    this.selEvent = this.s.events.find((e) => t >= e.start && t <= e.end) || null;
     this.selSound = this.soundList().find((s) => t >= s.s - 1000 && t <= s.e + 1000) || null;
     const ci = this.clipAt(x);
     if (this.segAt(t) >= 0 || ci >= 0) {
@@ -1831,8 +1758,33 @@ class NightView {
   }
 
   // ---- drawing
+  // Redraw at most once per frame (pinch, drag and the slider can fire many events per frame)
+  requestDraw() {
+    if (this.drawQueued) return;
+    this.drawQueued = true;
+    requestAnimationFrame(() => { this.drawQueued = false; if (this.root.isConnected) this.draw(); });
+  }
+
+  // The graph itself is cached in an off-screen layer and only re-rendered when the view or data change;
+  // during playback each frame just copies it and draws the playhead.
   draw() {
     const { g, w, h } = setupCanvas(this.cv);
+    const key = [w, h, this.v0, this.v1, this.thr, this.cat, this.selSound && this.selSound.s, this.version].join();
+    if (key !== this.layerKey) { this.renderLayer(w, h); this.layerKey = key; }
+    g.drawImage(this.layer, 0, 0, w, h);
+    const t = this.curT();
+    if (t !== null) {
+      const x = this.xOf(t);
+      if (x >= 0 && x <= w) { g.fillStyle = '#fff'; g.fillRect(x - 1, 0, 2, h - 18); }
+    }
+  }
+
+  renderLayer(w, h) {
+    const dpr = window.devicePixelRatio || 1;
+    if (!this.layer) this.layer = document.createElement('canvas');
+    this.layer.width = Math.round(w * dpr); this.layer.height = Math.round(h * dpr);
+    const g = this.layer.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const s = this.s, ch = h - 18; // bottom strip for time labels
     const y = (db) => yOf(db, ch);
     const span = this.v1 - this.v0;
@@ -1843,25 +1795,17 @@ class NightView {
     [40, 60, 80].forEach((db) => { g.beginPath(); g.moveTo(0, y(db)); g.lineTo(w, y(db)); g.stroke(); g.fillText(db, 2, y(db) - 2); });
 
     // sound level (max per pixel column)
-    const n = s.levels.length;
+    const lv = s.levels, n = lv.length;
     g.fillStyle = css('--accent');
     for (let px = 0; px < w; px++) {
       const a = Math.floor((this.tAt(px) - s.start) / 1000);
       const b = Math.max(a + 1, Math.ceil((this.tAt(px + 1) - s.start) / 1000));
       let m = -1;
-      for (let i = Math.max(0, a); i < b && i < n; i++) m = Math.max(m, s.levels[i]);
-      if (m < 0) continue;
+      for (let i = Math.max(0, a); i < b && i < n; i++) if (lv[i] > m) m = lv[i];
+      if (m <= 0) continue;
       const yy = y(m);
       g.fillRect(px, yy, 1, ch - yy);
     }
-
-    // breathing pauses (drawn over the level so they stay visible)
-    s.events.forEach((e) => {
-      const x0 = this.xOf(e.start), x1 = this.xOf(e.end);
-      if (x1 < 0 || x0 > w) return;
-      g.fillStyle = e === this.selEvent ? 'rgba(255,138,101,.75)' : 'rgba(255,138,101,.55)';
-      g.fillRect(x0, 0, Math.max(2, x1 - x0), ch);
-    });
 
     // recognised sounds: colored band along the top; the selected category is also highlighted over the graph
     this.runs().forEach((r) => {
@@ -1897,13 +1841,6 @@ class NightView {
         if (x1 < 0 || x0 > w) return;
         g.fillRect(x0, ch - 13, Math.max(3, x1 - x0), 3);
       });
-    }
-
-    // playhead
-    const t = this.curT();
-    if (t !== null) {
-      const x = this.xOf(t);
-      if (x >= 0 && x <= w) { g.fillStyle = '#fff'; g.fillRect(x - 1, 0, 2, ch); }
     }
 
     // time axis: pick a step that leaves ~80 px between labels
@@ -1957,13 +1894,13 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 // keep today's tile up to date during the night
-setInterval(() => { if (Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden) renderWeek(); }, 60000);
+setInterval(() => { if (Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden) renderWeek(USE_NATIVE); }, 60000);
 
 // ---------------------------------------------------------------- boot
 fillSettings();
 setRunningUI(false);
 Meter.start();
-renderWeek();
+renderWeek().then(() => setTimeout(autoRecognise, 3000));
 refreshState();
 window.addEventListener('beforeunload', (e) => { if (Monitor.running && !USE_NATIVE) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
 if ('serviceWorker' in navigator && location.protocol !== 'file:' && !NATIVE) {
