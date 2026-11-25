@@ -152,7 +152,7 @@ const WebMonitor = {
   level: 0,
   preBuf: [], preLen: 0,      // pre-roll audio kept before a clip starts
   clip: null,                 // clip being recorded: { start, chunks, len, peak, lastLoud, tag }
-  secMax: 0, secStart: 0,     // per-second level aggregation for the night graph
+  secMax: 0, secSamples: 0,  // per-second level aggregation for the night graph
   saveTimer: null,
   seg: null, segTimer: null,  // whole-night recording
 
@@ -186,7 +186,7 @@ const WebMonitor = {
       clips: [],       // { id, start, duration, peak, tag } (audio is in the clips store)
       segments: [],    // whole-night recording: { id, start, duration, mime, size } (audio in segments store)
     };
-    Object.assign(this, { preBuf: [], preLen: 0, clip: null, secMax: 0, secStart: now });
+    Object.assign(this, { preBuf: [], preLen: 0, clip: null, secMax: 0, secSamples: 0 });
     this.running = true;
     await DB.putSession(this.session);
     this.saveTimer = setInterval(() => this.persist(), 30000);
@@ -283,14 +283,16 @@ const WebMonitor = {
     const level = toDb(Math.sqrt(sum / input.length));
     this.level = level;
 
-    // per-second maximum for the night graph; seconds with no audio (browser stalled) are stored as 0
+    // per-second maximum for the night graph, counted by audio received (a late callback still belongs to
+    // its own second); if audio really stopped (> 3 s behind the clock), the missing seconds are stored as 0
     this.secMax = Math.max(this.secMax, level);
-    if (now - this.secStart >= 1000) {
+    this.secSamples += input.length;
+    if (this.secSamples >= rate) {
       const lv = this.session.levels;
       lv.push(Math.round(this.secMax * 10) / 10);
-      this.secStart += 1000;
-      while (now - this.secStart >= 1000) { lv.push(0); this.secStart += 1000; }
-      this.secMax = level;
+      this.secSamples -= rate;
+      this.secMax = 0;
+      while (now - (this.session.start + lv.length * 1000) > 3000) lv.push(0);
     }
 
     this.handleClip(resample(input, rate, CLIP_RATE), level, now);
@@ -623,6 +625,7 @@ $('btnToggle').onclick = async () => {
   try {
     if (!Monitor.running) {
       Preview.stop(); // free the microphone for the recorder
+      Recog.cancelAll(); // and the CPU
       try {
         await Monitor.start();
       } catch (e) {
@@ -893,6 +896,7 @@ async function mountNight(el, src) {
   const status = el.querySelector('.an-status');
   const showJob = (job) => {
     if (job.error) { status.textContent = 'recognition unavailable'; status.title = String(job.error.message || job.error); return; }
+    if (job.cancelled) { status.textContent = 'paused'; return; }
     if (!job.done) { setTextEl(status, `recognising ${Math.round(job.progress * 100)}%`); return; }
     status.textContent = '';
     if (job.result && view.root.isConnected) {
@@ -901,6 +905,7 @@ async function mountNight(el, src) {
     }
   };
   if (live) status.textContent = 'after the night';
+  else if (Monitor.running) { if (Recog.needs(view.s)) status.textContent = 'after the recording'; }
   else if (Recog.needs(view.s) && (view.segs.length || view.clips.length)) {
     const job = Recog.run(src, d);
     job.listeners.add(showJob);
@@ -1003,11 +1008,13 @@ function drawSpark(cv, src) {
   ((s.analysis && s.analysis.runs) || []).forEach((r) => { if (r.c === 'snore') g.fillRect(((r.s - s.start) / total) * w, 0, Math.max(1, ((r.e - r.s) / total) * w), Math.max(3, h * 0.18)); });
 }
 
-let renderSeq = 0;
+let reloadSeq = 0;
 async function renderWeek(reload = true) {
-  const seq = ++renderSeq;
-  if (reload) await loadNights();
-  if (seq !== renderSeq) return; // a newer refresh started meanwhile
+  if (reload) {
+    const seq = ++reloadSeq;
+    await loadNights();
+    if (seq !== reloadSeq) return; // a newer reload is on its way and will draw
+  }
   const ws = weekStart(weekOffset), we = addDays(ws, 7);
   const fmtD = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric' });
   $('weekLabel').textContent = weekOffset === 0 ? `This week · ${fmtD(ws)} – ${fmtD(addDays(ws, 6))}`
@@ -1062,7 +1069,7 @@ async function renderWeek(reload = true) {
     if (!job) return;
     const f = (j) => {
       if (!el.isConnected) { j.listeners.delete(f); return; }
-      if (j.done) { j.listeners.delete(f); renderWeek(false); return; }
+      if (j.done) { j.listeners.delete(f); setTimeout(() => renderWeek(false), 0); return; }
       setTextEl(el, `recognising ${Math.round(j.progress * 100)}%`);
     };
     job.listeners.add(f); f(job);
@@ -1094,9 +1101,11 @@ function closeNight() {
   $('nightPick').innerHTML = '';
 }
 
+let showSeq = 0;
 function openNight(list, idx) {
   openSheet($('nightSheet'));
   const show = async (i) => {
+    const seq = ++showSeq;
     closeNight();
     const src = list[i];
     $('nightTitle').textContent = fmtDate(src.s.start) + (src.live ? ' · recording' : '');
@@ -1112,7 +1121,9 @@ function openNight(list, idx) {
     const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
     $('nightBody').appendChild(el);
     $('nightBody').scrollTop = 0;
-    nightView = await mountNight(el, src);
+    const view = await mountNight(el, src);
+    if (seq === showSeq) nightView = view;
+    else if (view) { view.destroy(); openViews.delete(view); } // another night was picked meanwhile
   };
   show(idx);
 }
@@ -1123,7 +1134,7 @@ function openNight(list, idx) {
 const MP_VERSION = '1.2.2';
 const MP_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@${MP_VERSION}/`;
 const YAMNET_URL = 'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite';
-const ANALYSIS_VERSION = 1;
+const ANALYSIS_VERSION = 2; // 2: background skipped (nights analysed with v1 are redone)
 
 // Our categories, the YAMNet labels that map to them, and how they are shown
 const CATS = {
@@ -1197,38 +1208,81 @@ const Analyzer = {
   },
 
   // items: whole-night files (or clips) with { start, duration, blob | src }
-  async analyze(items, onProgress, cancelled) {
+  // spans: optional [[startMs, endMs], ...] to analyse (see activeSpans); everything else is skipped
+  async analyze(items, onProgress, cancelled, spans = null) {
     const clf = await this.load();
     let ctx;
     try { ctx = new OfflineAudioContext(1, 1, 16000); } catch { ctx = new OfflineAudioContext(1, 1, 22050); }
-    const total = items.reduce((n, it) => n + it.duration, 0) || 1;
+    // the parts of each file to classify, in ms relative to the file start, on YAMNet's 0.975 s window grid
+    // (all parts start on the same grid, so skipping background yields exactly the windows a full pass sees)
+    const W = 975;
+    const plan = items.map((it) => {
+      const len = it.duration * 1000;
+      if (!spans) return [[0, len]];
+      const out = [];
+      for (const [a, b] of spans) {
+        const x = Math.max(0, Math.floor((a - it.start) / W) * W), y = Math.min(len, Math.ceil((b - it.start) / W) * W);
+        if (y - x < 500) continue;
+        const last = out[out.length - 1];
+        if (last && x <= last[1]) last[1] = Math.max(last[1], y); else out.push([x, y]);
+      }
+      return out;
+    });
+    const total = plan.reduce((n, p) => n + p.reduce((m, [a, b]) => m + (b - a), 0), 0) || 1;
     let done = 0;
     const wins = [];
-    for (const it of items) {
+    for (let k = 0; k < items.length; k++) {
+      const it = items[k];
+      if (!plan[k].length) continue; // nothing but background in this file: don't even decode it
       if (cancelled()) return null;
       let buf;
       try {
         const ab = it.blob ? await it.blob.arrayBuffer() : await (await fetch(it.src)).arrayBuffer();
         buf = await ctx.decodeAudioData(ab);
-      } catch (e) { console.warn('could not decode', it.id, e); done += it.duration; continue; }
-      const data = buf.getChannelData(0), rate = buf.sampleRate, chunk = rate * 30;
-      for (let off = 0; off < data.length; off += chunk) {
-        if (cancelled()) return null;
-        const part = data.subarray(off, Math.min(data.length, off + chunk));
-        const res = clf.classify(part, rate);
-        const step = res.length ? (part.length / rate) * 1000 / res.length : 975;
-        res.forEach((r, i) => {
-          const pick = pickCategory(r.classifications[0] ? r.classifications[0].categories : []);
-          if (pick) wins.push({ t: it.start + (off / rate) * 1000 + (r.timestampMs ?? i * step), d: step, ...pick });
-        });
-        done += part.length / rate;
-        onProgress(Math.min(1, done / total));
-        await new Promise((r) => setTimeout(r, 0)); // keep the screen responsive
+      } catch (e) { console.warn('could not decode', it.id, e); done += plan[k].reduce((m, [a, b]) => m + (b - a), 0); continue; }
+      const data = buf.getChannelData(0), rate = buf.sampleRate, win = Math.round((W / 1000) * rate), chunk = win * 8; // ~8 s steps keep the screen smooth
+      for (const [a, b] of plan[k]) {
+        const end = Math.min(data.length, Math.round((b / 1000) * rate));
+        for (let off = Math.round((a / 1000) * rate); off < end; off += chunk) {
+          if (cancelled()) return null;
+          const part = data.subarray(off, Math.min(end, off + chunk));
+          if (part.length < win / 2) { done += (part.length / rate) * 1000; break; }
+          const res = clf.classify(part, rate);
+          const step = res.length ? (part.length / rate) * 1000 / res.length : 975;
+          res.forEach((r, i) => {
+            const pick = pickCategory(r.classifications[0] ? r.classifications[0].categories : []);
+            if (pick) wins.push({ t: it.start + (off / rate) * 1000 + (r.timestampMs ?? i * step), d: step, ...pick });
+          });
+          done += (part.length / rate) * 1000;
+          onProgress(Math.min(1, done / total));
+          await new Promise((r) => setTimeout(r, 0)); // keep the screen responsive
+        }
       }
     }
     return { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(wins) };
   },
 };
+
+// Which parts of a night are worth classifying: every second clearly above the room's background level,
+// plus 2 s on each side. Quiet background comes out as "Silence" anyway, so skipping it saves time
+// without changing the result. Returns null (= analyse everything) when the night has no level data.
+const GATE_DB = 2, GATE_PAD_S = 2;
+function activeSpans(s) {
+  const lv = s.levels || [];
+  const vals = lv.filter((v) => v > 0).sort((a, b) => a - b);
+  if (vals.length < 60) return null;
+  const gate = vals[Math.floor(vals.length * 0.1)] + GATE_DB; // background = 10th percentile
+  const spans = [];
+  let cur = null;
+  for (let i = 0; i < lv.length; i++) {
+    if (lv[i] > 0 && lv[i] < gate) continue; // 0 = no level data for that second: analyse it to be safe
+    const a = s.start + (i - GATE_PAD_S) * 1000, b = s.start + (i + 1 + GATE_PAD_S) * 1000;
+    if (cur && a <= cur[1] + 1000) cur[1] = b;
+    else { if (cur) spans.push(cur); cur = [a, b]; }
+  }
+  if (cur) spans.push(cur);
+  return spans;
+}
 
 // Background recognition: one night at a time; progress can be shown by the night view and the week grid.
 const Recog = {
@@ -1238,21 +1292,26 @@ const Recog = {
   run(src, loaded) {
     const id = src.s.id;
     if (this.jobs.has(id)) return this.jobs.get(id);
-    const job = { progress: 0, done: false, result: null, error: null, listeners: new Set() };
+    const job = { progress: 0, done: false, result: null, error: null, cancelled: false, listeners: new Set() };
     const notify = () => job.listeners.forEach((f) => { try { f(job); } catch (e) { console.warn(e); } });
     this.jobs.set(id, job);
     this.queue = this.queue.catch(() => {}).then(async () => {
       const d = loaded || await src.load();
       const items = d.segs.length ? d.segs : d.clips;
-      const res = items.length ? await Analyzer.analyze(items, (f) => { job.progress = f; notify(); }, () => false) : null;
+      if (job.cancelled) return;
+      const res = items.length ? await Analyzer.analyze(items, (f) => { job.progress = f; notify(); }, () => job.cancelled, activeSpans(d.s)) : null;
       if (res) {
         await src.saveAnalysis(res).catch((e) => console.warn('analysis not saved', e));
         src.s.analysis = res;
       }
       job.result = res;
     }).catch((e) => { console.warn('recognition failed', e); job.error = e; })
-      .finally(() => { job.done = true; notify(); this.jobs.delete(id); });
+      .finally(() => { this.jobs.delete(id); job.done = true; notify(); });
     return job;
+  },
+  // stop all analysis (e.g. a recording starts: it must get the CPU)
+  cancelAll() {
+    this.jobs.forEach((job) => { job.cancelled = true; });
   },
 };
 
@@ -1769,7 +1828,7 @@ class NightView {
   // during playback each frame just copies it and draws the playhead.
   draw() {
     const { g, w, h } = setupCanvas(this.cv);
-    const key = [w, h, this.v0, this.v1, this.thr, this.cat, this.selSound && this.selSound.s, this.version].join();
+    const key = [w, h, window.devicePixelRatio, this.v0, this.v1, this.thr, this.cat, this.selSound && this.selSound.s, this.version].join();
     if (key !== this.layerKey) { this.renderLayer(w, h); this.layerKey = key; }
     g.drawImage(this.layer, 0, 0, w, h);
     const t = this.curT();

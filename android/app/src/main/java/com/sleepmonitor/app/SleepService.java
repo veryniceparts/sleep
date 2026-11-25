@@ -87,7 +87,7 @@ public class SleepService extends Service {
 
     // ---- processing state (worker thread only)
     private double secMax = 0;
-    private long secStart = 0, lastSave = 0, lastNotif = 0;
+    private long secSamples = 0, lastSave = 0, lastNotif = 0;
     private final ArrayDeque<short[]> preBuf = new ArrayDeque<>();
     private int preLen = 0;
     private ArrayList<short[]> clipChunks;
@@ -156,7 +156,7 @@ public class SleepService extends Service {
             while (segments.length() > 0) segments.remove(0);
         }
         level = 0; clipActive = false; fullBytes = 0;
-        secMax = 0; secStart = now; lastSave = now; lastNotif = now;
+        secMax = 0; secSamples = 0; lastSave = now; lastNotif = now;
         preBuf.clear(); preLen = 0; clipChunks = null; clipLen = 0;
         aac = null;
 
@@ -240,13 +240,15 @@ public class SleepService extends Service {
         level = lv;
 
         synchronized (lock) {
-            // per-second maximum; seconds without audio (microphone taken by a call, ...) are stored as 0
+            // per-second maximum, counted by audio received (a thread hiccup doesn't lose a second); if the audio
+            // really stopped (microphone taken by a call, ...) and is > 3 s behind the clock, store the gap as 0
             secMax = Math.max(secMax, lv);
-            if (now - secStart >= 1000) {
+            secSamples += n;
+            if (secSamples >= RATE) {
                 levels.add(Math.round(secMax * 10) / 10f);
-                secStart += 1000;
-                while (now - secStart >= 1000) { levels.add(0f); secStart += 1000; }
-                secMax = lv;
+                secSamples -= RATE;
+                secMax = 0;
+                while (now - (start + levels.size() * 1000L) > 3000) levels.add(0f);
             }
         }
 
