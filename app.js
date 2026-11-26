@@ -1610,10 +1610,16 @@ class NightView {
     this.ui.play.onclick = () => this.toggle();
     this.ui.prev.onclick = () => this.jump(-1);
     this.ui.next.onclick = () => this.jump(1);
-    this.ui.seek.oninput = () => {
-      const it = this.item();
-      if (it && !this.fixing) this.audio.currentTime = (this.ui.seek.value / 1000) * it.duration;
-      this.draw();
+    // seek bar = the whole night: drag to preview a moment, release to play from there
+    const seekT = () => this.t0 + (this.ui.seek.value / 1000) * (this.tEnd() - this.t0);
+    this.ui.seek.oninput = () => { this.scrubT = seekT(); this.updatePlayer(); this.requestDraw(); };
+    this.ui.seek.onchange = () => {
+      const t = seekT();
+      this.scrubT = null;
+      this.ui.seek.blur();
+      this.updatePlayer();
+      this.playAt(t); // (says so in the title if there is no audio at that moment)
+      this.requestDraw();
     };
     this.audio.addEventListener('play', () => { this.ui.play.textContent = '⏸'; this.loop(); });
     this.audio.addEventListener('pause', () => { if (!this.fixing) this.ui.play.textContent = '▶'; this.draw(); });
@@ -1915,25 +1921,27 @@ class NightView {
     u.prev.disabled = !this.targetSound(-1);
     u.next.disabled = !this.targetSound(1);
     u.play.disabled = !hasAudio;
-    if (!it) {
-      u.title.textContent = this.segs.length ? 'Tap the graph to listen to any moment'
-        : this.clips.length ? 'Tap the graph or a clip to play' : 'No audio saved this night';
-      u.seek.value = 0; u.time.textContent = '0:00';
-      return;
+    // the seek bar and its label always describe the whole night: where we are / when it ended
+    const t0 = this.t0, end = this.tEnd();
+    const t = this.scrubT != null ? this.scrubT : it ? this.curT() : null;
+    if (this.scrubT == null) {
+      const sv = String(t === null ? 0 : Math.round(Math.min(1, Math.max(0, (t - t0) / (end - t0))) * 1000));
+      if (u.seek.value !== sv) u.seek.value = sv;
     }
-    const at = this.pos(), t = this.curT();
-    if (this.mode === 'seg') {
-      const r = this.catAt(t);
-      const title = `${fmtTime(t)}` + (r ? ' · ' + (r.c === 'other' ? r.l : CATS[r.c].name) : '');
-      if (u.title.textContent !== title) u.title.textContent = title;
-    } else {
-      u.title.textContent = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(t)} · peak ${it.peak} dB` +
-        (it.tag === 'after pause' ? ' · after pause' : '');
-    }
-    const sv = String(it.duration ? Math.round((at / it.duration) * 1000) : 0);
-    if (u.seek.value !== sv && document.activeElement !== u.seek) u.seek.value = sv;
-    const tt = `${fmtClock(at)} / ${fmtClock(it.duration)}`;
+    const tt = `${hm(t === null ? t0 : t)} / ${hm(end)}`;
     if (u.time.textContent !== tt) u.time.textContent = tt;
+    let title;
+    if (this.scrubT != null) title = `Release to play from ${fmtTime(t)}`;
+    else if (!it) {
+      title = this.segs.length ? 'Tap the graph to listen to any moment'
+        : this.clips.length ? 'Tap the graph or a clip to play' : 'No audio saved this night';
+    } else if (this.mode === 'seg') {
+      const r = this.catAt(t);
+      title = `${fmtTime(t)}` + (r ? ' · ' + (r.c === 'other' ? r.l : CATS[r.c].name) : '');
+    } else {
+      title = `Clip ${this.cur + 1}/${this.clips.length} · ${fmtTime(t)} · peak ${it.peak} dB`;
+    }
+    if (u.title.textContent !== title) u.title.textContent = title;
   }
 
   loop() {
@@ -2110,7 +2118,7 @@ class NightView {
     if (key !== this.layerKey) { this.renderLayer(w, h); this.layerKey = key; }
     g.drawImage(this.layer, 0, 0, w, h);
     if (!this.thrDrag) this.placeThr(this.thr, h - 18);
-    const t = this.curT();
+    const t = this.scrubT != null ? this.scrubT : this.curT();
     if (t !== null) {
       const x = this.xOf(t);
       if (x >= 0 && x <= w) { g.fillStyle = '#fff'; g.fillRect(x - 1, 0, 2, h - 18); }
