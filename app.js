@@ -2002,8 +2002,9 @@ class NightView {
       const sv = String(t === null ? 0 : Math.round(Math.min(1, Math.max(0, (t - t0) / (end - t0))) * 1000));
       if (u.seek.value !== sv) u.seek.value = sv;
     }
-    const tt = `${hm(t === null ? t0 : t)} / ${hm(end)}`;
-    if (u.time.textContent !== tt) u.time.textContent = tt;
+    const clock = (x) => new Date(x).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); // "9:05 PM", not "09:05 PM"
+    const tt = `${clock(t === null ? t0 : t)} / ${clock(end)}`;
+    if (u.time.textContent !== tt) { u.time.textContent = tt; u.seek.title = `${clock(t0)} – ${clock(end)}`; }
     let title;
     if (this.scrubT != null) title = `Release to play from ${fmtTime(t)}`;
     else if (!it) {
