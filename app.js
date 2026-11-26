@@ -878,17 +878,6 @@ async function mountNight(el, src) {
   };
   chipBox.onclick = (e) => { const b = e.target.closest('.chip'); if (b) view.setCategory(b.dataset.c); };
 
-  // threshold for this night: changes which sounds count as loud (applied at most once per frame)
-  const thrIn = el.querySelector('.thr-in'), thrV = el.querySelector('.thr-v');
-  thrIn.value = view.thr; thrV.textContent = view.thr;
-  let thrQueued = false;
-  thrIn.oninput = () => {
-    thrV.textContent = thrIn.value;
-    if (thrQueued) return;
-    thrQueued = true;
-    requestAnimationFrame(() => { thrQueued = false; view.setThreshold(+thrIn.value); });
-  };
-
   view.onDataChanged = () => { renderSounds(); renderChips(); renderSummary(); };
   view.onDataChanged();
 
@@ -1413,8 +1402,11 @@ class NightView {
     this.audio.addEventListener('timeupdate', () => this.updatePlayer());
 
     this.bindPointer();
+    this.bindThreshold();
     this.onResize = () => this.requestDraw();
     window.addEventListener('resize', this.onResize);
+    // the chart box can also change size without a window resize (e.g. when the lists below fill in)
+    if (window.ResizeObserver) { this.ro = new ResizeObserver(this.onResize); this.ro.observe(this.cv); }
     this.counts = this.countKey();
     if (this.live) {
       // night still being recorded: pick up new clips/files/pauses and keep the graph growing
@@ -1437,6 +1429,7 @@ class NightView {
     if (this.onDestroy) this.onDestroy();
     if (this.ac) this.ac.close().catch(() => {});
     window.removeEventListener('resize', this.onResize);
+    if (this.ro) this.ro.disconnect();
     clearInterval(this.liveTimer);
     this.urls.forEach((u) => URL.revokeObjectURL(u));
   }
@@ -1776,6 +1769,49 @@ class NightView {
     }, { passive: false });
   }
 
+  // threshold handle: drag it up/down on the right edge of the graph (its own element, so it never conflicts with pan/zoom/tap)
+  bindThreshold() {
+    const hd = this.root.querySelector('.thr-handle'), cv = this.cv;
+    this.thrUI = { hd, lab: hd.querySelector('.thr-lab'), y: null, v: null };
+    let grab = null, queued = false;
+    const valAt = (clientY) => {
+      const ch = cv.getBoundingClientRect().height - 18, y = clientY - cv.getBoundingClientRect().top - grab.off;
+      return Math.round(Math.min(95, Math.max(30, DB_MIN + (1 - y / ch) * (DB_MAX - DB_MIN))));
+    };
+    hd.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      hd.setPointerCapture(e.pointerId);
+      const r = cv.getBoundingClientRect();
+      grab = { id: e.pointerId, off: e.clientY - r.top - yOf(this.thr, r.height - 18), v: this.thr };
+      hd.classList.add('drag'); this.thrDrag = true;
+      this.tip.hidden = true;
+    });
+    hd.addEventListener('pointermove', (e) => {
+      if (!grab || e.pointerId !== grab.id) return;
+      const v = valAt(e.clientY);
+      if (v === grab.v) return;
+      grab.v = v;
+      this.placeThr(v); // handle + label follow immediately; the sounds/graph update once per frame
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; if (this.thrUI.v !== this.thr) this.setThreshold(this.thrUI.v); });
+    });
+    const up = (e) => {
+      if (!grab || e.pointerId !== grab.id) return;
+      grab = null;
+      hd.classList.remove('drag'); this.thrDrag = false;
+      if (this.thrUI.v !== this.thr) this.setThreshold(this.thrUI.v);
+    };
+    hd.addEventListener('pointerup', up);
+    hd.addEventListener('pointercancel', up);
+  }
+
+  placeThr(v, ch = this.cv.clientHeight - 18) {
+    const u = this.thrUI, y = Math.round(yOf(v, ch));
+    if (u.v !== v) { u.v = v; u.lab.textContent = v; u.hd.setAttribute('aria-valuenow', v); }
+    if (u.y !== y) { u.y = y; u.hd.style.transform = `translateY(${y}px)`; }
+  }
+
   clipAt(x) {
     const t = this.tAt(x), pxPerMs = this.width() / (this.v1 - this.v0);
     let best = -1, bestD = 16; // px tolerance for tapping thin clips
@@ -1831,6 +1867,7 @@ class NightView {
     const key = [w, h, window.devicePixelRatio, this.v0, this.v1, this.thr, this.cat, this.selSound && this.selSound.s, this.version].join();
     if (key !== this.layerKey) { this.renderLayer(w, h); this.layerKey = key; }
     g.drawImage(this.layer, 0, 0, w, h);
+    if (!this.thrDrag) this.placeThr(this.thr, h - 18);
     const t = this.curT();
     if (t !== null) {
       const x = this.xOf(t);
