@@ -13,6 +13,7 @@ const DEFAULTS = {
   preRoll: 3,        // s of audio kept before the trigger
   postRoll: 4,       // s of quiet before a clip ends
   maxClip: 60,       // s max clip length
+  maxGap: 600,       // s: snores at most this far apart belong to the same snoring session
   recordAll: true,   // record the whole night (compressed)
 };
 const CLIP_RATE = 16000;     // saved audio sample rate (Hz)
@@ -46,6 +47,7 @@ function loadSettings() {
 }
 function saveSettings() {
   try { localStorage.setItem('sleepmon.settings', JSON.stringify(settings)); } catch {}
+  if (typeof openViews !== 'undefined') openViews.forEach((v) => { v.recalc(); v.rowMark = null; if (v.onDataChanged) v.onDataChanged(); v.requestDraw(); });
   if (USE_NATIVE && NativeMonitor.running) SR.update({ settings: { ...settings } }).catch(() => {});
 }
 
@@ -189,6 +191,7 @@ const WebMonitor = {
     Object.assign(this, { preBuf: [], preLen: 0, clip: null, secMax: 0, secSamples: 0 });
     this.running = true;
     await DB.putSession(this.session);
+    this.live = LiveRecog.start(this.session);
     this.saveTimer = setInterval(() => this.persist(), 30000);
     if (record) this.setRecordAll(true);
   },
@@ -243,6 +246,7 @@ const WebMonitor = {
       await DB.putSegment({ ...meta, sessionId: g.session.id, blob });
       await DB.putSession(g.session);
     } catch (e) { console.error('segment save failed', e); }
+    if (this.live && this.live.session === g.session) LiveRecog.add(this.live, meta, blob);
   },
 
   fullBytes() {
@@ -260,6 +264,7 @@ const WebMonitor = {
     const capped = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(r, ms))]);
     if (this.clip) await capped(this.finishClip(), 4000);
     if (this.seg) { const g = this.seg; this.seg = null; await capped(this.endSegment(g), 4000); }
+    if (this.live) { LiveRecog.finish(this.live); this.live = null; } // completes in the background
     try { this.proc.disconnect(); this.src.disconnect(); this.sink.disconnect(); } catch {}
     this.stream.getTracks().forEach((t) => t.stop());
     capped(this.ctx.close(), 2000).catch(() => {});
@@ -833,8 +838,10 @@ async function mountNight(el, src) {
     const s = view.s;
     const dur = (live ? Date.now() : s.end) - s.start;
     const snore = snoreMs(s);
+    const ns = view.sessions.length;
     return `${fmtDur(dur)} · ${view.sounds.length} loud sounds` +
-      (snore !== null ? ` · snoring ${fmtSnore(snore)}` : '') + (view.segs.length ? ` · ${fmtMB(segBytes(s))}` : '');
+      (snore !== null ? ` · snoring ${fmtSnore(snore)}${ns ? ` in ${ns} session${ns === 1 ? '' : 's'}` : ''}` : '') +
+      (view.segs.length ? ` · ${fmtMB(segBytes(s))}` : '');
   };
   let d;
   try { d = await src.load(); } catch (e) { alert('Could not open this night: ' + e.message); return null; }
@@ -854,6 +861,14 @@ async function mountNight(el, src) {
   let shown = [];
   const renderSounds = () => {
     shown = view.soundList();
+    if (view.cat === 'sessions') {
+      sndBox.innerHTML = shown.length ? shown.map((x, i) =>
+        `<div class="list-item clickable snd-row" data-i="${i}"><span>${hm(x.s)}–${hm(x.e)}</span><b>${durShort(Math.max(60000, x.e - x.s))}</b>` +
+        `<span class="muted">${x.n} snore${x.n === 1 ? '' : 's'}</span><span class="grow"></span><span class="muted">▶</span></div>`).join('')
+        : `<p class="muted empty">No snoring above ${view.thr} dB.</p>`;
+      view.rowMark = null; view.markRows();
+      return;
+    }
     sndBox.innerHTML = shown.length ? shown.map((x, i) => {
       const cat = x.c ? CATS[x.c] : null;
       return `<div class="list-item clickable snd-row" data-i="${i}"><span>${fmtTime(x.s)}</span><span>${Math.round((x.e - x.s) / 1000)}s</span>` +
@@ -870,7 +885,9 @@ async function mountNight(el, src) {
     const runs = view.runs(), secs = {}, count = {};
     runs.forEach((r) => { secs[r.c] = (secs[r.c] || 0) + (r.e - r.s) / 1000; });
     view.sounds.forEach((x) => { if (x.c) count[x.c] = (count[x.c] || 0) + 1; });
-    chipBox.innerHTML = CAT_ORDER.filter((c) => secs[c]).map((c) => {
+    const ses = view.sessions.length ? `<button class="chip${view.cat === 'sessions' ? ' on' : ''}" data-c="sessions" style="--c:${CATS.snore.color}">` +
+      `Snoring sessions <span>${view.sessions.length}</span></button>` : '';
+    chipBox.innerHTML = ses + CAT_ORDER.filter((c) => secs[c]).map((c) => {
       const m = Math.round(secs[c] / 60), n = count[c];
       return `<button class="chip${view.cat === c ? ' on' : ''}" data-c="${c}" style="--c:${CATS[c].color}">${CATS[c].name} ` +
         `<span>${m ? m + 'm' : Math.round(secs[c]) + 's'}${n ? ' · ' + n : ''}</span></button>`;
@@ -904,7 +921,7 @@ async function mountNight(el, src) {
       view.recalc(); view.onDataChanged(); view.requestDraw();
     }
   };
-  if (live) status.textContent = 'after the night';
+  if (live) status.textContent = view.s.analysis ? 'live' : 'after the night';
   else if (Monitor.running) { if (Recog.needs(view.s)) status.textContent = 'after the recording'; }
   else if (Recog.needs(view.s) && (view.segs.length || view.clips.length)) {
     const job = Recog.run(src, d);
@@ -1210,6 +1227,13 @@ const Analyzer = {
   // items: whole-night files (or clips) with { start, duration, blob | src }
   // spans: optional [[startMs, endMs], ...] to analyse (see activeSpans); everything else is skipped
   async analyze(items, onProgress, cancelled, spans = null) {
+    const wins = await this.analyzeWins(items, onProgress, cancelled, spans);
+    return wins && { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(wins) };
+  },
+
+  // same, but returns the labelled windows (so a night can be analysed piece by piece while recording)
+  // stepWins: windows per classify() call; small steps (2) are used while recording to keep audio smooth
+  async analyzeWins(items, onProgress, cancelled, spans = null, stepWins = 8) {
     const clf = await this.load();
     let ctx;
     try { ctx = new OfflineAudioContext(1, 1, 16000); } catch { ctx = new OfflineAudioContext(1, 1, 22050); }
@@ -1240,7 +1264,7 @@ const Analyzer = {
         const ab = it.blob ? await it.blob.arrayBuffer() : await (await fetch(it.src)).arrayBuffer();
         buf = await ctx.decodeAudioData(ab);
       } catch (e) { console.warn('could not decode', it.id, e); done += plan[k].reduce((m, [a, b]) => m + (b - a), 0); continue; }
-      const data = buf.getChannelData(0), rate = buf.sampleRate, win = Math.round((W / 1000) * rate), chunk = win * 8; // ~8 s steps keep the screen smooth
+      const data = buf.getChannelData(0), rate = buf.sampleRate, win = Math.round((W / 1000) * rate), chunk = win * stepWins; // small steps keep the screen smooth
       for (const [a, b] of plan[k]) {
         const end = Math.min(data.length, Math.round((b / 1000) * rate));
         for (let off = Math.round((a / 1000) * rate); off < end; off += chunk) {
@@ -1259,7 +1283,7 @@ const Analyzer = {
         }
       }
     }
-    return { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(wins) };
+    return wins;
   },
 };
 
@@ -1284,11 +1308,45 @@ function activeSpans(s) {
   return spans;
 }
 
+// Live recognition while recording in the browser: every finished 10-minute file is analysed in small steps
+// while the recording continues; the night's analysis is updated as it goes and is complete shortly after Stop.
+// (In the Android app the native recorder does this itself.)
+const LiveRecog = {
+  pending: new Map(), // night id -> promise that resolves when its live analysis is complete
+  start(session) { return { session, wins: [], queue: Promise.resolve(), failed: false }; },
+  add(L, meta, blob) {
+    L.queue = L.queue.then(async () => {
+      if (L.failed) return;
+      try {
+        const wins = await Analyzer.analyzeWins([{ ...meta, blob }], () => {}, () => false, activeSpans(L.session), 2);
+        L.wins.push(...wins);
+        L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), partial: true, runs: mergeRuns(L.wins.slice()) };
+      } catch (e) {
+        console.warn('live recognition stopped', e);
+        L.failed = true;
+        delete L.session.analysis; // the night is analysed after it ends instead
+      }
+    });
+  },
+  // after the last file is saved: finish, store the complete result
+  finish(L) {
+    const id = L.session.id;
+    const p = L.queue.then(async () => {
+      if (L.failed) return;
+      L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins) };
+      await DB.putSession(L.session).catch(() => {});
+    }).finally(() => this.pending.delete(id));
+    this.pending.set(id, p);
+    return p;
+  },
+};
+
 // Background recognition: one night at a time; progress can be shown by the night view and the week grid.
 const Recog = {
   jobs: new Map(),          // night id -> { progress, done, result, error, listeners }
   queue: Promise.resolve(),
-  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION),
+  // a night needs (re)analysis unless it has a complete result of the current version
+  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION && !s.analysis.partial),
   run(src, loaded) {
     const id = src.s.id;
     if (this.jobs.has(id)) return this.jobs.get(id);
@@ -1296,6 +1354,9 @@ const Recog = {
     const notify = () => job.listeners.forEach((f) => { try { f(job); } catch (e) { console.warn(e); } });
     this.jobs.set(id, job);
     this.queue = this.queue.catch(() => {}).then(async () => {
+      // a night just recorded in the browser may still be finishing its live analysis: use that instead
+      if (LiveRecog.pending.has(id)) { await LiveRecog.pending.get(id); loaded = await src.load(); }
+      if (loaded && !Recog.needs(loaded.s)) { src.s.analysis = job.result = loaded.s.analysis; return; }
       const d = loaded || await src.load();
       const items = d.segs.length ? d.segs : d.clips;
       if (job.cancelled) return;
@@ -1322,6 +1383,19 @@ function autoRecognise() {
     .filter((n) => !n.live && Recog.needs(n.s) && Date.now() - n.s.start < 3 * 864e5 && ((n.s.segments || []).length || (n.s.clips || []).length))
     .sort((a, b) => b.s.start - a.s.start)[0];
   if (cand) { Recog.run(cand); renderWeek(false); }
+}
+
+// Snoring sessions: loud snores (above the night's threshold) no more than `maxGap` seconds apart
+// belong to the same session.
+function computeSessions(sounds, maxGapS) {
+  const gap = (maxGapS || 600) * 1000, out = [];
+  for (const x of sounds) {
+    if (x.c !== 'snore') continue;
+    const last = out[out.length - 1];
+    if (last && x.s - last.e <= gap) { last.e = Math.max(last.e, x.e); last.n++; last.peak = Math.max(last.peak, x.peak); }
+    else out.push({ s: x.s, e: x.e, n: 1, peak: x.peak, c: 'snore', session: true });
+  }
+  return out;
 }
 
 // loud sounds = runs of seconds at or above the threshold (gaps up to 3 s are joined)
@@ -1446,6 +1520,7 @@ class NightView {
   // ---- threshold, sounds and categories
   recalc() {
     this.sounds = computeSounds(this.s, this.thr, this.s.analysis && this.s.analysis.runs);
+    this.sessions = computeSessions(this.sounds, settings.maxGap);
     this.version = (this.version || 0) + 1;
   }
   setThreshold(v) {
@@ -1462,7 +1537,11 @@ class NightView {
     if (this.onDataChanged) this.onDataChanged();
     this.draw();
   }
-  soundList() { return this.cat ? this.sounds.filter((x) => x.c === this.cat) : this.sounds; }
+  // what the list, the markers and prev/next work on: all loud sounds, one category, or snoring sessions
+  soundList() {
+    if (this.cat === 'sessions') return this.sessions;
+    return this.cat ? this.sounds.filter((x) => x.c === this.cat) : this.sounds;
+  }
   runs() { return (this.s.analysis && this.s.analysis.runs) || []; }
   // run (recognised sound) at time t: binary search, runs are sorted and don't overlap
   catAt(t) {
@@ -1891,6 +1970,17 @@ class NightView {
       if (x === this.selSound) { g.globalAlpha = 0.2; g.fillRect(x0, 8, cw, ch - 8); g.globalAlpha = 1; g.fillRect(x0, ch - 10, cw, 10); }
       else g.fillRect(x0, ch - 6, cw, 6);
     });
+
+    // snoring sessions: purple bars just above the loud-sound markers
+    if (this.cat !== 'sessions') {
+      g.fillStyle = CATS.snore.color; g.globalAlpha = 0.7;
+      this.sessions.forEach((x) => {
+        const x0 = this.xOf(x.s), x1 = this.xOf(x.e);
+        if (x1 < 0 || x0 > w) return;
+        g.fillRect(x0, ch - 11, Math.max(3, x1 - x0), 3);
+      });
+      g.globalAlpha = 1;
+    }
 
     // saved clips (only when there is no whole-night recording to play from)
     if (!this.segs.length) {
