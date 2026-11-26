@@ -439,7 +439,7 @@ const NativeMonitor = {
   async resume() {
     const st = await SR.status();
     this.apply(st);
-    if (st.running) this.poll();
+    if (st.running) this.poll(); // (also while a stopped night is still being saved)
     return st.running;
   },
   poll() {
@@ -448,15 +448,22 @@ const NativeMonitor = {
       if (document.visibilityState !== 'visible') return;
       try {
         const st = await SR.status();
-        const was = this.running;
+        const was = this.running || this.saving;
         this.apply(st);
-        if (was && !st.running) { clearInterval(this.pollTimer); this.pollTimer = null; onStoppedElsewhere(); }
+        if (!this.running && $('btnToggle').textContent === 'Stop') setRunningUI(false); // stopped from the notification
+        $('btnToggle').disabled = this.saving;
+        // refresh only once the night is completely written (reading it earlier gives a stale copy)
+        if (was && !st.running) { clearInterval(this.pollTimer); this.pollTimer = null; $('btnToggle').disabled = false; onStoppedElsewhere(); }
       } catch {}
     }, 120);
   },
+  // status fields (SleepService.status): running = recording OR still saving a stopped night;
+  // stopping = the night was stopped and is being written; error = why the last night ended by itself
   apply(st) {
-    this.running = !!st.running;
-    if (!st.running) { this.session = null; this.clip = false; this.seg = false; return; }
+    this.saving = !!(st.running && st.stopping);
+    this.running = !!st.running && !st.stopping; // recording right now
+    this.error = st.running ? null : st.error || null;
+    if (!this.running) { this.session = null; this.clip = false; this.seg = false; return; }
     this.level = st.level; this.clip = st.clipActive; this.seg = st.recordAll; this.bytes = st.fullBytes;
     this.session = { id: st.sessionId, start: st.start, clips: { length: st.clipCount } };
   },
@@ -668,6 +675,7 @@ function updateStatus() {
   const s = Monitor.running ? Monitor.session : null;
   if (calib && Meter.raw !== null) calib.push(Meter.raw);
   let state, info;
+  if (Monitor.saving) { setText('stState', 'Saving the night…'); setText('stInfo', 'Writing the last recording, a few seconds'); return; }
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
     state = Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound' : 'Monitoring';
@@ -728,6 +736,7 @@ $('btnToggle').onclick = async () => {
 
 // monitoring was stopped from the notification's Stop button
 async function onStoppedElsewhere() {
+  if (Monitor.error) lastSaved = `Recording stopped: ${Monitor.error}`;
   setRunningUI(false);
   startPreview();
   await renderWeek();
