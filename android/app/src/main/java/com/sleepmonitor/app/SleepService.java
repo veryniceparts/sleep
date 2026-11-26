@@ -42,6 +42,7 @@ import java.util.concurrent.TimeUnit;
  *  - level of each 64 ms frame in relative dB (0 = silence, ~100 = full scale)
  *  - clips: WAV files of sounds above the threshold, with pre-roll
  *  - optional whole-night recording as 10-minute AAC (.m4a) files
+ *  - sound recognition (YAMNet) while recording, stored as the night's "analysis" (see SoundRecognizer)
  *
  * Data per night lives in files/sleep/<sessionId>/ (session.json + audio files), in the same
  * JSON shape the web app uses, so the History screen can show it.
@@ -96,6 +97,7 @@ public class SleepService extends Service {
     private double clipPeak = 0;
     private String clipTag = "loud";
     private AacWriter aac = null;
+    private volatile SoundRecognizer recog = null;
 
     static File rootDir(Context c) {
         File d = new File(c.getFilesDir(), "sleep");
@@ -159,6 +161,9 @@ public class SleepService extends Service {
         secMax = 0; secSamples = 0; lastSave = now; lastNotif = now;
         preBuf.clear(); preLen = 0; clipChunks = null; clipLen = 0;
         aac = null;
+        // recognise sounds while recording; if the model can't run here, the app analyses the night afterwards
+        recog = new SoundRecognizer(now, () -> YamnetModel.load(getAssets()));
+        recog.start();
 
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SleepMonitor:monitor");
@@ -175,7 +180,7 @@ public class SleepService extends Service {
     JSONObject stopMonitoring() {
         if (!running && worker == null) { stopSelf(); return null; }
         running = false;
-        try { if (worker != null) worker.join(5000); } catch (InterruptedException ignored) { }
+        try { if (worker != null) worker.join(15000); } catch (InterruptedException ignored) { }
         worker = null;
         JSONObject summary = summary();
         io.shutdown();
@@ -229,6 +234,8 @@ public class SleepService extends Service {
             rec.release();
             if (clipChunks != null) finishClip();
             if (aac != null) finishSegment();
+            SoundRecognizer r = recog;
+            if (r != null) r.finish(8000); // classify what is still queued, then the analysis is final
             saveSession();
         }
     }
@@ -238,19 +245,28 @@ public class SleepService extends Service {
         for (int i = 0; i < n; i++) { double v = buf[i] / 32768.0; sum += v * v; }
         double lv = Math.max(0, 20 * Math.log10(Math.sqrt(sum / n) + 1e-10) + 100);
         level = lv;
+        SoundRecognizer r = recog;
+        double t;
 
         synchronized (lock) {
+            t = start + levels.size() * 1000.0 + secSamples * 1000.0 / RATE; // time of buf[0] on the levels timeline
             // per-second maximum, counted by audio received (a thread hiccup doesn't lose a second); if the audio
             // really stopped (microphone taken by a call, ...) and is > 3 s behind the clock, store the gap as 0
             secMax = Math.max(secMax, lv);
             secSamples += n;
             if (secSamples >= RATE) {
-                levels.add(Math.round(secMax * 10) / 10f);
+                float sec = Math.round(secMax * 10) / 10f;
+                levels.add(sec);
+                if (r != null) r.second(sec);
                 secSamples -= RATE;
                 secMax = 0;
-                while (now - (start + levels.size() * 1000L) > 3000) levels.add(0f);
+                while (now - (start + levels.size() * 1000L) > 3000) {
+                    levels.add(0f);
+                    if (r != null) r.second(0f);
+                }
             }
         }
+        if (r != null) r.feed(buf, n, t, lv);
 
         short[] chunk = Arrays.copyOf(buf, n);
         handleClip(chunk, lv, now);
@@ -379,6 +395,8 @@ public class SleepService extends Service {
     /** Full session JSON (same shape as the web app), including levels. */
     JSONObject snapshot(boolean withLevels) {
         JSONObject s = new JSONObject();
+        SoundRecognizer r = recog;
+        JSONObject analysis = r != null ? r.toJson() : null; // outside our lock (the recognizer has its own)
         synchronized (lock) {
             try {
                 s.put("id", sessionId);
@@ -394,6 +412,7 @@ public class SleepService extends Service {
                 s.put("events", new JSONArray()); // breathing pauses are no longer detected
                 s.put("clips", new JSONArray(clips.toString()));
                 s.put("segments", new JSONArray(segments.toString()));
+                if (analysis != null) s.put("analysis", analysis);
             } catch (JSONException ignored) { }
         }
         return s;
@@ -452,6 +471,8 @@ public class SleepService extends Service {
             o.put("clipActive", clipActive);
             o.put("recordAll", recordAll);
             o.put("fullBytes", currentFullBytes());
+            SoundRecognizer r = recog;
+            if (r != null) o.put("recognized", r.progress()); // windows classified so far (-1: unavailable)
             synchronized (lock) {
                 o.put("sessionId", sessionId);
                 o.put("start", start);

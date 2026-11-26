@@ -1288,7 +1288,8 @@ function activeSpans(s) {
 const Recog = {
   jobs: new Map(),          // night id -> { progress, done, result, error, listeners }
   queue: Promise.resolve(),
-  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION),
+  // the Android app recognises sounds while recording; "partial" = that night's recording was cut off
+  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION && !(s.analysis.partial && !s.live)),
   run(src, loaded) {
     const id = src.s.id;
     if (this.jobs.has(id)) return this.jobs.get(id);
