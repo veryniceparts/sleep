@@ -102,6 +102,8 @@ final class SoundRecognizer {
     // ---- state for status / logs
     volatile boolean ready = false, failed = false, done = false;
     volatile int classified = 0, skipped = 0, dropped = 0;
+    /** Some audio was not classified (queue overflow, finish timed out, classifier error): stays "partial". */
+    volatile boolean incomplete = false;
 
     SoundRecognizer(long start, Loader loader) {
         this.start = start;
@@ -185,6 +187,7 @@ final class SoundRecognizer {
                 if (drop == null) drop = queue.peekFirst();
                 queue.remove(drop);
                 pool.addLast(drop.pcm);
+                incomplete = true;
                 if (dropped++ % 100 == 0) {
                     Log.w(TAG, "recognition is behind, dropped " + dropped + " windows (last at "
                             + Math.round(drop.t - start) + " ms, " + (drop.peak < gate ? "background" : "not background") + ")");
@@ -214,6 +217,7 @@ final class SoundRecognizer {
                 synchronized (lock) {
                     Log.w(TAG, "recognition not finished in time, " + queue.size() + " windows left out");
                     abort = true;
+                    incomplete = true;
                     queue.clear();
                     lock.notifyAll();
                 }
@@ -271,6 +275,7 @@ final class SoundRecognizer {
                     scores = model.classify(in);
                 } catch (Exception e) {
                     Log.w(TAG, "classification failed", e);
+                    incomplete = true;
                     continue;
                 }
                 Pick pick = pickCategory(scores, labels, labelCat);
@@ -365,7 +370,8 @@ final class SoundRecognizer {
     /**
      * The night's "analysis" in the app's format ({ v, at, runs: [{ s, e, c, p, l }] }), or null while the
      * model isn't loaded or if recognition is unavailable. "partial" is set while the night is recorded,
-     * so a night whose recording was cut off (app killed) is still analysed by the app afterwards.
+     * so a night whose recording was cut off (app killed) is still analysed by the app afterwards, and stays
+     * set when some audio was not classified (windows dropped, finish timed out), so the app analyses it again.
      */
     JSONObject toJson() {
         if (!ready || failed) return null;
@@ -387,7 +393,7 @@ final class SoundRecognizer {
             }
             o.put("v", VERSION);
             o.put("at", System.currentTimeMillis());
-            if (!done) o.put("partial", true);
+            if (!done || incomplete) o.put("partial", true);
             o.put("runs", arr);
         } catch (JSONException e) {
             return null;

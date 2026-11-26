@@ -87,11 +87,11 @@ public class SleepRecorderPlugin extends Plugin {
             call.reject("Could not start monitoring: " + e.getMessage());
             return;
         }
-        // wait (max 3 s) until the service is up so the first status is meaningful
+        // wait (max 3 s) until the service records so the first status is meaningful
         new Thread(() -> {
             for (int t = 0; t < 60; t++) {
                 SleepService s = SleepService.instance;
-                if (s != null && s.isRunning()) break;
+                if (s != null && s.isRecording()) break;
                 try { Thread.sleep(50); } catch (InterruptedException ignored) { }
             }
             call.resolve(statusObject());
@@ -118,6 +118,9 @@ public class SleepRecorderPlugin extends Plugin {
         if (s == null || !s.isRunning()) {
             JSObject r = new JSObject();
             r.put("running", false);
+            r.put("stopping", false);
+            String err = SleepService.lastError; // why the last night ended by itself, if it did
+            if (err != null) r.put("error", err);
             return r;
         }
         return toJS(s.status());
@@ -132,9 +135,14 @@ public class SleepRecorderPlugin extends Plugin {
     }
 
     // ------------------------------------------------------------------ saved nights
+    /** The service while this night is in memory: being recorded or still being saved (files not final yet). */
     private static SleepService liveService(String id) {
         SleepService s = SleepService.instance;
-        return s != null && s.isRunning() && id != null && id.equals(s.sessionId) ? s : null;
+        return s != null && id != null && s.isLive(id) ? s : null;
+    }
+
+    private static String busyMessage(SleepService live, String id) {
+        return live.isStopping(id) ? "The night is still being saved, try again in a few seconds." : "Stop monitoring first.";
     }
 
     @PluginMethod
@@ -146,11 +154,14 @@ public class SleepRecorderPlugin extends Plugin {
                 if (!d.isDirectory()) continue;
                 try {
                     SleepService live = liveService(d.getName());
-                    JSONObject s = live != null ? live.snapshot(true) : readSession(d);
+                    JSONObject s = live != null ? live.snapshot(d.getName(), true) : null;
+                    boolean isLive = s != null;
+                    if (s == null) s = readSession(d);
                     if (s == null) continue;
                     s.put("spark", spark(s.optJSONArray("levels"), 60)); // small graph for the week grid
                     s.remove("levels");
-                    s.put("live", live != null);
+                    s.put("live", isLive);
+                    s.put("stopping", isLive && live.isStopping(d.getName()));
                     s.put("bytes", dirSize(d));
                     list.put(s);
                 } catch (Exception ignored) { }
@@ -168,9 +179,12 @@ public class SleepRecorderPlugin extends Plugin {
         if (d == null) { call.reject("not found"); return; }
         try {
             SleepService live = liveService(id);
-            JSONObject s = live != null ? live.snapshot(true) : readSession(d);
+            JSONObject s = live != null ? live.snapshot(id, true) : null;
+            boolean isLive = s != null;
+            if (s == null) s = readSession(d);
             if (s == null) { call.reject("not found"); return; }
-            s.put("live", live != null);
+            s.put("live", isLive);
+            s.put("stopping", isLive && live.isStopping(id));
             addPaths(s.optJSONArray("clips"), d);
             addPaths(s.optJSONArray("segments"), d);
             JSObject r = new JSObject();
@@ -184,7 +198,8 @@ public class SleepRecorderPlugin extends Plugin {
     @PluginMethod
     public void deleteSession(PluginCall call) {
         String id = call.getString("id");
-        if (liveService(id) != null) { call.reject("Stop monitoring first."); return; }
+        SleepService live = liveService(id);
+        if (live != null) { call.reject(busyMessage(live, id)); return; }
         File d = sessionDir(id);
         if (d != null) deleteRecursive(d);
         call.resolve();
@@ -194,7 +209,7 @@ public class SleepRecorderPlugin extends Plugin {
     public void deleteClip(PluginCall call) {
         String id = call.getString("sessionId"), clipId = call.getString("clipId");
         SleepService live = liveService(id);
-        if (live != null) { live.removeClip(clipId); call.resolve(); return; }
+        if (live != null && live.removeClip(id, clipId)) { call.resolve(); return; } // else: saved meanwhile
         File d = sessionDir(id);
         try {
             JSONObject s = d == null ? null : readSession(d);
@@ -218,7 +233,8 @@ public class SleepRecorderPlugin extends Plugin {
     @PluginMethod
     public void deleteFull(PluginCall call) {
         String id = call.getString("sessionId");
-        if (liveService(id) != null) { call.reject("Stop monitoring first."); return; }
+        SleepService live = liveService(id);
+        if (live != null) { call.reject(busyMessage(live, id)); return; }
         File d = sessionDir(id);
         try {
             JSONObject s = d == null ? null : readSession(d);
@@ -240,7 +256,11 @@ public class SleepRecorderPlugin extends Plugin {
     public void saveAnalysis(PluginCall call) {
         String id = call.getString("sessionId");
         JSObject analysis = call.getObject("analysis");
-        if (liveService(id) != null) { call.reject("Night is still being recorded"); return; }
+        SleepService live = liveService(id);
+        if (live != null) {
+            call.reject(live.isStopping(id) ? "Night is still being saved" : "Night is still being recorded");
+            return;
+        }
         File d = sessionDir(id);
         try {
             JSONObject s = d == null ? null : readSession(d);
