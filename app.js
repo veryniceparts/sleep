@@ -2327,6 +2327,13 @@ document.addEventListener('visibilitychange', () => {
 // keep today's tile up to date during the night
 setInterval(() => { if (Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden) renderWeek(USE_NATIVE); }, 60000);
 
+// Android Back button (called by MainActivity): close the top screen; false = nothing to close
+window.handleBack = () => {
+  if (!$('nightOverlay').hidden) { $('nightOverlay').hidden = true; clearInterval(nightClockTimer); return true; }
+  if (layers.length) { closeTop(); return true; }
+  return false;
+};
+
 // ---------------------------------------------------------------- boot
 fillSettings();
 setRunningUI(false);

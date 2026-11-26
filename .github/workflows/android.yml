@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# one build at a time, in push order (an older build must never be published as "latest" after a newer one)
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -35,7 +40,8 @@ jobs:
         run: npm ci
 
       - name: Download the sound-recognition model (YAMNet)
-        run: npm run fetch-model
+        run: |
+          for i in 1 2 3; do npm run fetch-model && break; [ "$i" = 3 ] && exit 1; echo "retrying in 15 s"; sleep 15; done
 
       - name: Copy web app into the Android project
         run: |
