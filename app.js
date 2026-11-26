@@ -958,7 +958,16 @@ async function mountNight(el, src) {
     view.rowMark = null;
     view.markRows();
   };
-  sndBox.onclick = (e) => { const r = e.target.closest('.snd-row'); if (r) view.playSound(shown[+r.dataset.i]); };
+  // tap = play (zoom unchanged); double tap = zoom in on that sound
+  let lastRow = null, lastRowAt = 0;
+  sndBox.onclick = (e) => {
+    const r = e.target.closest('.snd-row');
+    if (!r) return;
+    const x = shown[+r.dataset.i], now = performance.now();
+    if (lastRow === x && now - lastRowAt < 400) { view.focusSound(x); lastRow = null; return; }
+    lastRow = x; lastRowAt = now;
+    view.playSound(x);
+  };
 
   // category chips: how long each kind of sound was heard and how many loud sounds it caused; tap to highlight
   const renderChips = () => {
@@ -1804,10 +1813,18 @@ class NightView {
     if (x) this.playSound(x);
   }
 
+  // zoom in on a sound (double tap)
+  focusSound(x) {
+    this.selSound = x;
+    const span = Math.max(60000, (x.e - x.s) * 6), mid = (x.s + x.e) / 2;
+    this.setView(mid - span / 2, mid + span / 2);
+  }
+
+  // play a sound from the list; the zoom stays as it is (the graph only slides if the sound is off-screen)
   playSound(x) {
     this.selSound = x;
-    const span = Math.max(60000, (x.e - x.s) * 6);
-    if (this.v1 - this.v0 > span * 3 || x.s < this.v0 || x.e > this.v1) this.setView((x.s + x.e) / 2 - span / 2, (x.s + x.e) / 2 + span / 2);
+    if (x.e < this.v0 || x.s > this.v1) { const sp = this.v1 - this.v0, mid = (x.s + x.e) / 2; this.setView(mid - sp / 2, mid + sp / 2); }
+    this.requestDraw();
     this.playAt(Math.max(this.t0, x.s - 1500));
   }
 
@@ -2018,7 +2035,17 @@ class NightView {
   }
 
   tap(x) {
-    const t = this.tAt(x);
+    const t = this.tAt(x), now = performance.now();
+    // double tap on the graph: zoom in on the sound there (or 2x around that point)
+    if (this.lastTap && now - this.lastTap.at < 400 && Math.abs(x - this.lastTap.x) < 30) {
+      this.lastTap = null;
+      const tol = 16 * (this.v1 - this.v0) / this.width(); // a finger's width, in ms at the current zoom
+      let hit = null, best = Infinity;
+      for (const s of this.soundList()) { const d = t < s.s ? s.s - t : t > s.e ? t - s.e : 0; if (d <= tol && d < best) { best = d; hit = s; } }
+      if (hit) this.focusSound(hit); else this.zoomAt(t, 0.5);
+      return;
+    }
+    this.lastTap = { at: now, x };
     this.selSound = this.soundList().find((s) => t >= s.s - 1000 && t <= s.e + 1000) || null;
     const ci = this.clipAt(x);
     if (this.segAt(t) >= 0 || ci >= 0) {
