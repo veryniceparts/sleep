@@ -13,6 +13,7 @@ const DEFAULTS = {
   preRoll: 3,        // s of audio kept before the trigger
   postRoll: 4,       // s of quiet before a clip ends
   maxClip: 60,       // s max clip length
+  maxGap: 600,       // s: snores closer together than this belong to the same snoring session
   recordAll: true,   // record the whole night (compressed)
 };
 const CLIP_RATE = 16000;     // saved audio sample rate (Hz)
@@ -713,29 +714,108 @@ $('nightOverlay').addEventListener('click', () => {
   lastTap = now;
 });
 
-// ---------------------------------------------------------------- sheets (⋮ menu, night detail)
-// Opening a sheet adds a history entry, so the phone's Back button closes it.
-function openSheet(sh) {
-  if (!sh.hidden) return;
-  sh.hidden = false;
-  history.pushState({ sheet: sh.id }, '');
+// ---------------------------------------------------------------- sheets (⋮ menus, settings, about, night detail)
+// Sheets and ⋮ menus are "layers". Opening one adds a history entry, so the phone's Back button closes the
+// topmost layer only. They animate in and out with CSS transitions on transform/opacity (.open, see styles.css);
+// a closing layer stays visible until its transition ends (with a timeout fallback), then gets `hidden`.
+const layers = [];
+const reducedMotion = window.matchMedia ? matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
+function afterTransition(el, fn) {
+  let t = 0;
+  const done = () => { el.removeEventListener('transitionend', onEnd); clearTimeout(t); fn(); };
+  const part = el.querySelector(':scope > .sheet-panel') || el; // the part that moves
+  const onEnd = (e) => { if (e.target === part && (e.propertyName === 'transform' || e.propertyName === 'opacity')) done(); };
+  if (reducedMotion.matches) { done(); return; }
+  el.addEventListener('transitionend', onEnd);
+  t = setTimeout(done, 450);
 }
-function hideSheet(sh) {
-  if (sh.hidden) return;
-  sh.hidden = true;
-  if (sh.id === 'nightSheet') { closeNight(); renderWeek(); }
+function showLayer(el) {
+  const tok = el._anim = {};
+  el.hidden = false;
+  void el.offsetWidth; // start from the closed state so the transition runs
+  el.classList.add('open');
+  return new Promise((resolve) => afterTransition(el, () => resolve(el._anim === tok)));
+}
+function hideLayer(el, then) {
+  if (el.hidden) { if (then) then(); return; }
+  const tok = el._anim = {};
+  if (el.contains(document.activeElement)) document.activeElement.blur(); // commits a half-typed setting
+  el.classList.remove('open');
+  afterTransition(el, () => { if (el._anim !== tok) return; el.hidden = true; if (then) then(); });
+}
+function openLayer(el, replace = false) {
+  if (layers.includes(el)) return Promise.resolve(true);
+  layers.push(el);
+  if (el.classList.contains('sheet')) el.style.zIndex = 20 + layers.length; // later sheets on top
+  const st = { layer: el.id || 'menu', depth: layers.length };
+  if (replace) history.replaceState(st, ''); else history.pushState(st, '');
+  histDepth = layers.length;
+  return showLayer(el);
+}
+// take a layer off the stack and animate it out (history is handled by the caller)
+function dropLayer(el) {
+  const i = layers.indexOf(el);
+  if (i < 0) return;
+  layers.splice(i, 1);
+  if (el.id === 'nightSheet') { hideLayer(el, () => { if (!layers.includes(el)) closeNight(); }); renderWeek(); }
+  else hideLayer(el);
+}
+// depth of our history entries once queued back navigations are done (each open layer has one)
+let histDepth = 0;
+const stateDepth = () => (history.state && history.state.depth) || 0;
+function goBack(n) { histDepth -= n; history.go(-n); }
+function closeTop() {
+  if (!layers.length) return;
+  const top = layers[layers.length - 1];
+  if (histDepth === layers.length) goBack(1);
+  dropLayer(top); // right away, so code running next sees the new stack (popstate then finds nothing to do)
 }
 function closeSheets() {
-  const open = [...document.querySelectorAll('.sheet')].filter((s) => !s.hidden);
-  if (open.length && history.state && history.state.sheet) history.back();
-  else open.forEach(hideSheet);
+  const n = Math.min(layers.length, histDepth);
+  while (layers.length) dropLayer(layers[layers.length - 1]);
+  if (n > 0) goBack(n);
 }
-window.addEventListener('popstate', () => document.querySelectorAll('.sheet').forEach(hideSheet));
-document.querySelectorAll('.sheet').forEach((sh) => {
-  sh.addEventListener('click', (e) => { if (e.target === sh) closeSheets(); });
-  sh.querySelector('.sheet-close').onclick = closeSheets;
+const openSheet = (sh) => openLayer(sh);
+window.addEventListener('popstate', () => {
+  histDepth = stateDepth();
+  while (layers.length > histDepth) dropLayer(layers[layers.length - 1]);
 });
-$('btnMenu').onclick = () => { openSheet($('menuSheet')); updateStorageInfo(); };
+if (stateDepth()) history.replaceState(null, ''); // reloaded with a sheet open: start from the main screen
+document.querySelectorAll('.sheet').forEach((sh) => {
+  sh.addEventListener('click', (e) => { if (e.target === sh && layers[layers.length - 1] === sh) closeTop(); });
+  sh.querySelector('.sheet-close').onclick = closeTop;
+});
+
+// ⋮ menus: the top bar's (#appMenu) and the night screen's (.s-actions of the shown night)
+const topLayer = () => layers[layers.length - 1];
+function toggleMenu(menu) {
+  if (topLayer() === menu) closeTop();
+  else if (menu && !layers.includes(menu)) { if (topLayer() && topLayer().classList.contains('popmenu')) closeTop(); openLayer(menu); }
+}
+// a menu item: Settings/About replace the menu (Back then returns to what was below it); others just close it
+function onMenuClick(menu, e) {
+  const b = e.target.closest('button');
+  if (!b || topLayer() !== menu) return;
+  const target = b.dataset.open && $(b.dataset.open);
+  if (!target) { closeTop(); return; }
+  const replace = histDepth === layers.length;
+  layers.pop(); hideLayer(menu); // its history entry becomes the sheet's
+  if (target.id === 'menuSheet') fillSettings();
+  updateStorageInfo();
+  openLayer(target, replace);
+}
+function wireMenu(menu) {
+  menu.addEventListener('click', (e) => onMenuClick(menu, e));
+}
+wireMenu($('appMenu'));
+$('btnMenu').onclick = (e) => { e.stopPropagation(); toggleMenu($('appMenu')); };
+// tapping anywhere outside an open menu closes it
+document.addEventListener('click', (e) => {
+  const m = topLayer();
+  if (m && m.classList.contains('popmenu') && !m.contains(e.target)) closeTop();
+});
+$('appVersion').textContent = window.APP_VERSION || 'dev';
+if (NATIVE) $('linkReleases').removeAttribute('target'); // the app opens external links in the browser
 
 async function updateStorageInfo() {
   let text = '';
@@ -746,12 +826,13 @@ async function updateStorageInfo() {
     const { usage = 0, quota = 0 } = await navigator.storage.estimate();
     text = `${(usage / 1e6).toFixed(1)} MB used of ${(quota / 1e9).toFixed(1)} GB`;
   }
-  $('storageInfo').textContent = text;
+  document.querySelectorAll('.storage-info').forEach((el) => { el.textContent = text; });
 }
 
 // ---------------------------------------------------------------- settings
 const FIELDS = {
   setThreshold: 'threshold', setPreRoll: 'preRoll', setPostRoll: 'postRoll', setMaxClip: 'maxClip',
+  setMaxGap: 'maxGap',
 };
 function fillSettings() {
   for (const [id, key] of Object.entries(FIELDS)) $(id).value = settings[key];
@@ -913,12 +994,7 @@ async function mountNight(el, src) {
     showJob(job);
   }
 
-  // actions live in the ⋮ menu of the night screen
-  const actions = el.querySelector('.s-actions');
-  $('nightMenu').onclick = (e) => { e.stopPropagation(); actions.hidden = !actions.hidden; };
-  actions.addEventListener('click', () => { actions.hidden = true; });
-  el.addEventListener('click', (e) => { if (!actions.hidden && !actions.contains(e.target)) actions.hidden = true; });
-
+  // actions live in the ⋮ menu of the night screen (opened and closed by openNight)
   el.querySelector('.btn-csv').onclick = () => {
     const s = view.s;
     const rows = [['type', 'start', 'end', 'duration_s', 'peak_db', 'note']];
@@ -1076,8 +1152,16 @@ async function renderWeek(reload = true) {
   });
 }
 
-$('weekPrev').onclick = () => { weekOffset--; renderWeek(false); };
-$('weekNext').onclick = () => { if (weekOffset < 0) { weekOffset++; renderWeek(false); } };
+// the new week slides in from the side it comes from
+function slideWeek(dir) {
+  renderWeek(false);
+  const g = $('weekGrid');
+  if (reducedMotion.matches || !g.animate) return;
+  g.animate([{ transform: `translateX(${dir * 32}px)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
+    { duration: 220, easing: 'cubic-bezier(.2,.8,.2,1)' });
+}
+$('weekPrev').onclick = () => { weekOffset--; slideWeek(-1); };
+$('weekNext').onclick = () => { if (weekOffset < 0) { weekOffset++; slideWeek(1); } };
 // swipe the grid sideways to change week
 (() => {
   let x0 = null;
@@ -1101,11 +1185,15 @@ function closeNight() {
   $('nightPick').innerHTML = '';
 }
 
+// shown at once while a night loads (its data is read and drawn after the slide-in, so that stays smooth)
+const NIGHT_PLACEHOLDER = '<div class="ph-line"></div><div class="ph-tools"></div><div class="ph-chart"></div>' +
+  '<div class="ph-player"></div><div class="ph-list"></div>';
 let showSeq = 0;
 function openNight(list, idx) {
-  openSheet($('nightSheet'));
+  const opened = openSheet($('nightSheet'));
   const show = async (i) => {
     const seq = ++showSeq;
+    if (topLayer() && topLayer().classList.contains('popmenu')) closeTop();
     closeNight();
     const src = list[i];
     $('nightTitle').textContent = fmtDate(src.s.start) + (src.live ? ' · recording' : '');
@@ -1119,11 +1207,23 @@ function openNight(list, idx) {
       });
     }
     const el = $('sessionTpl').content.firstElementChild.cloneNode(true);
-    $('nightBody').appendChild(el);
+    el.classList.add('loading');
+    const ph = document.createElement('div');
+    ph.className = 'night-ph';
+    ph.innerHTML = NIGHT_PLACEHOLDER;
+    $('nightBody').append(el, ph);
     $('nightBody').scrollTop = 0;
+    const menu = el.querySelector('.s-actions');
+    wireMenu(menu);
+    $('nightMenu').onclick = (e) => { e.stopPropagation(); toggleMenu(menu); };
+    await opened;
+    if (seq !== showSeq) return;
     const view = await mountNight(el, src);
     if (seq === showSeq) nightView = view;
     else if (view) { view.destroy(); openViews.delete(view); } // another night was picked meanwhile
+    el.classList.remove('loading');
+    ph.classList.add('gone');
+    afterTransition(ph, () => ph.remove());
   };
   show(idx);
 }
