@@ -1,6 +1,6 @@
 // Caches the app shell so it opens offline. Recordings live in IndexedDB, not here.
 const CACHE = 'sleepmon-v9';
-const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon.svg'];
+const ASSETS = ['./', 'index.html', 'styles.css', 'version.js', 'app.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));

@@ -16,7 +16,11 @@
   <div id="app">
     <header class="topbar">
       <h1>Sleep Monitor</h1>
-      <button id="btnMenu" class="icon-btn" aria-label="Settings">⋮</button>
+      <button id="btnMenu" class="icon-btn" aria-label="Menu" aria-haspopup="menu">⋮</button>
+      <div id="appMenu" class="popmenu" role="menu" hidden>
+        <button data-open="menuSheet" role="menuitem">Settings</button>
+        <button data-open="aboutSheet" role="menuitem">About</button>
+      </div>
     </header>
 
     <!-- live monitor: level, graph and Start/Stop in one card -->
@@ -51,7 +55,7 @@
     </section>
   </div>
 
-  <!-- settings (⋮) -->
+  <!-- settings (⋮ > Settings) -->
   <div id="menuSheet" class="sheet" hidden>
     <div class="sheet-panel">
       <div class="sheet-head">
@@ -69,19 +73,49 @@
 
         <h3>Recording</h3>
         <label class="field row-field"><span>Threshold (dB)</span>
-          <input type="number" id="setThreshold" min="20" max="100" step="1"></label>
+          <input type="number" id="setThreshold" min="20" max="100" step="1" inputmode="numeric"></label>
+        <p class="field-help">Sounds louder than this are saved as clips (same as the slider).</p>
         <label class="field row-field"><span>Pre-roll (s)</span>
-          <input type="number" id="setPreRoll" min="0" max="15" step="1"></label>
+          <input type="number" id="setPreRoll" min="0" max="15" step="1" inputmode="numeric"></label>
+        <p class="field-help">Audio kept from just before a sound starts.</p>
         <label class="field row-field"><span>Stop after quiet for (s)</span>
-          <input type="number" id="setPostRoll" min="1" max="30" step="1"></label>
+          <input type="number" id="setPostRoll" min="1" max="30" step="1" inputmode="numeric"></label>
+        <p class="field-help">A clip ends after this much quiet.</p>
         <label class="field row-field"><span>Max clip length (s)</span>
-          <input type="number" id="setMaxClip" min="5" max="300" step="5"></label>
+          <input type="number" id="setMaxClip" min="5" max="300" step="5" inputmode="numeric"></label>
+        <p class="field-help">Longer sounds are split into several clips.</p>
 
+        <h3>Snoring</h3>
+        <label class="field row-field"><span>Max gap between snores (s)</span>
+          <input type="number" id="setMaxGap" min="30" max="3600" step="10" inputmode="numeric"></label>
+        <p class="field-help">Snores (above the loudness threshold) closer together than this count as one snoring session.</p>
 
         <div class="actions"><button id="btnResetSettings">Reset to defaults</button></div>
-        <p class="muted small" id="storageInfo"></p>
+        <p class="muted small storage-info" id="storageInfo"></p>
         <p class="muted small">Levels are relative (0 = silence, ~100 = maximum) and differ between phones.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- about (⋮ > About) -->
+  <div id="aboutSheet" class="sheet" hidden>
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <h2>About</h2>
+        <button class="icon-btn sheet-close" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-body about">
+        <div class="about-app">
+          <img src="icon.svg" alt="" width="48" height="48">
+          <div><b>Sleep Monitor</b><div class="muted small">Version <span id="appVersion">dev</span></div></div>
+        </div>
+        <p>Records the whole night and saves a clip of every loud sound. Afterwards it recognises the sounds
+          (snoring, coughing, talking, …) on your phone with Google's YAMNet model via MediaPipe.
+          Nothing is uploaded: recordings stay on this device.</p>
         <p class="disclaimer">⚠️ Not a medical device and can't diagnose sleep apnea. A sleep study is the only reliable diagnosis.</p>
+        <p class="muted small">Storage: <span class="storage-info"></span></p>
+        <div class="actions"><a id="linkReleases" class="link-btn" href="https://github.com/veryniceparts/sleep/releases"
+          target="_blank" rel="noopener">Releases &amp; updates on GitHub</a></div>
       </div>
     </div>
   </div>
@@ -92,7 +126,7 @@
       <div class="sheet-head">
         <button class="icon-btn sheet-close" aria-label="Back">‹</button>
         <h2 id="nightTitle"></h2>
-        <button id="nightMenu" class="icon-btn" aria-label="Actions">⋮</button>
+        <button id="nightMenu" class="icon-btn" aria-label="Menu" aria-haspopup="menu">⋮</button>
       </div>
       <div id="nightPick" class="night-pick"></div>
       <div class="sheet-body" id="nightBody"></div>
@@ -142,7 +176,10 @@
         </section>
       </div>
 
-      <div class="s-actions" hidden>
+      <div class="s-actions popmenu" role="menu" hidden>
+        <button data-open="menuSheet">Settings</button>
+        <button data-open="aboutSheet">About</button>
+        <hr>
         <button class="btn-csv">Export CSV</button>
         <button class="btn-dlall">Download clips</button>
         <button class="btn-dlfull" hidden>Download full recording</button>
@@ -152,6 +189,7 @@
     </div>
   </template>
 
+  <script src="version.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
