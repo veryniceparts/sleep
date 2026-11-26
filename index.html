@@ -114,13 +114,11 @@
         <button class="z-out" aria-label="Zoom out">−</button>
         <button class="z-in" aria-label="Zoom in">+</button>
         <button class="z-all">All</button>
-        <label class="thr-night" title="Sounds louder than this count as loud sounds for this night">
-          <span>Loud ≥ <b class="thr-v">60</b></span>
-          <input type="range" class="thr-in" min="30" max="95" step="1">
-        </label>
       </div>
       <div class="chart-box">
         <canvas class="s-chart"></canvas>
+        <div class="thr-handle" role="slider" aria-label="Loud sound threshold (dB)" aria-valuemin="30" aria-valuemax="95"
+          title="Drag: sounds louder than this count as loud sounds for this night"><b class="thr-lab">60</b><span class="thr-dot"></span></div>
         <div class="s-tip" hidden></div>
       </div>
 
