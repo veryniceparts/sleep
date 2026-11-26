@@ -26,6 +26,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+          cache: gradle # reuse downloaded libraries between builds
 
       - name: Check Android SDK (preinstalled on GitHub runners)
         run: echo "ANDROID_HOME=$ANDROID_HOME" && ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
@@ -46,7 +47,12 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          # retry: a temporary outage of a library server (Maven Central) shouldn't fail the build
+          for i in 1 2 3; do
+            ./gradlew assembleRelease --no-daemon && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "Build attempt $i failed, retrying in 30 s"; sleep 30
+          done
           cp app/build/outputs/apk/release/app-release.apk ../SleepMonitor.apk
 
       - uses: actions/upload-artifact@v4
