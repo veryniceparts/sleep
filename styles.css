@@ -199,8 +199,12 @@ canvas { display: block; }
 .thr-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--danger); border: 2px solid var(--panel2);
   box-shadow: 0 0 0 1px var(--danger), 0 1px 4px rgba(0,0,0,.5); transition: transform .15s ease-out; }
 .thr-lab { font-size: .72rem; font-weight: 700; color: var(--danger); font-variant-numeric: tabular-nums; line-height: 1;
-  padding: 2px 4px; border-radius: 6px; background: rgba(11,15,23,.75); }
+  padding: 2px 4px; border-radius: 6px; background: rgba(11,15,23,.75);
+  transform-origin: right center; transition: transform .15s ease-out, background-color .15s, box-shadow .15s; }
 .thr-handle.drag .thr-dot { transform: scale(1.45); }
+/* while dragging, the value moves up-left out from under the finger and gets bigger */
+.thr-handle.drag .thr-lab { transform: translate(-46px, -46px) scale(1.7); background: var(--panel2);
+  box-shadow: 0 0 0 1px var(--danger), 0 4px 12px rgba(0,0,0,.6); }
 .p-boost { padding: 8px 8px; min-width: 44px; font-size: .85rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .p-boost.on { border-color: var(--clip); color: var(--clip); }
 .an-status { float: right; font-weight: 500; color: var(--accent); }
