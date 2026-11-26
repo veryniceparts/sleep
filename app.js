@@ -1695,6 +1695,14 @@ class NightView {
       this.playAt(t); // (says so in the title if there is no audio at that moment)
       this.requestDraw();
     };
+    // no 'change' comes when the thumb is released where the drag started, or when the drag is cancelled:
+    // end the preview then (after any 'change' of this release has run) so the bar never stays frozen
+    const endScrub = () => setTimeout(() => {
+      if (this.scrubT == null) return;
+      this.scrubT = null;
+      this.updatePlayer(); this.requestDraw();
+    }, 0);
+    for (const ev of ['pointerup', 'pointercancel', 'touchend', 'touchcancel', 'lostpointercapture', 'blur']) this.ui.seek.addEventListener(ev, endScrub);
     this.audio.addEventListener('play', () => { this.ui.play.textContent = '⏸'; this.loop(); });
     this.audio.addEventListener('pause', () => { if (!this.fixing) this.ui.play.textContent = '▶'; this.draw(); });
     this.audio.addEventListener('ended', () => this.onEnded());
