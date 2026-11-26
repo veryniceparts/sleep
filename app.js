@@ -1194,6 +1194,7 @@ window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer
 
 // ---------------------------------------------------------------- one night (full screen)
 function closeNight() {
+  if (!$('nightSheet').classList.contains('open')) nightSwitch = null;
   if (nightView) { nightView.destroy(); openViews.delete(nightView); nightView = null; }
   $('nightBody').innerHTML = '';
   $('nightPick').innerHTML = '';
@@ -1203,8 +1204,26 @@ function closeNight() {
 const NIGHT_PLACEHOLDER = '<div class="ph-line"></div><div class="ph-tools"></div><div class="ph-chart"></div>' +
   '<div class="ph-player"></div><div class="ph-list"></div>';
 let showSeq = 0;
+let nightSwitch = null; // set while a night is open: switches to the previous/next recorded day
+const mainIndex = (list) => list.reduce((bi, n, i) => (nightEnd(n) - n.s.start > nightEnd(list[bi]) - list[bi].s.start ? i : bi), 0);
 function openNight(list, idx) {
   const opened = openSheet($('nightSheet'));
+  // swipe left/right outside the graph: next/previous day that has a recording
+  nightSwitch = async (dir) => {
+    const days = [...new Set(allNights.map((n) => nightDay(n.s.start)))].sort((a, b) => a - b);
+    const k = days.indexOf(nightDay(list[0].s.start)) + dir;
+    const body = $('nightBody'), still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (k < 0 || k >= days.length) { // no more recordings that way: small bounce
+      if (!still && body.animate) body.animate([{ transform: 'none' }, { transform: `translateX(${-dir * 14}px)` }, { transform: 'none' }], { duration: 220, easing: 'ease-out' });
+      return;
+    }
+    list = allNights.filter((n) => nightDay(n.s.start) === days[k]).sort((a, b) => a.s.start - b.s.start);
+    // the week grid will show this day's week when the night is closed (+12 h guards against DST shifts)
+    weekOffset = Math.min(0, Math.floor((days[k] + 12 * 3600e3 - weekStart(0)) / (7 * 864e5)));
+    if (!still && body.animate) await body.animate([{ transform: 'none', opacity: 1 }, { transform: `translateX(${-dir * 40}px)`, opacity: 0 }], { duration: 120, easing: 'ease-in' }).finished.catch(() => {});
+    show(mainIndex(list));
+    if (!still && body.animate) body.animate([{ transform: `translateX(${dir * 40}px)`, opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 180, easing: 'ease-out' });
+  };
   const show = async (i) => {
     const seq = ++showSeq;
     if (topLayer() && topLayer().classList.contains('popmenu')) closeTop();
@@ -1241,6 +1260,22 @@ function openNight(list, idx) {
   };
   show(idx);
 }
+
+(() => {
+  const panel = $('nightSheet').querySelector('.sheet-panel');
+  let start = null;
+  panel.addEventListener('pointerdown', (e) => {
+    // the graph, threshold handle, chips row, seek bar and menus have their own gestures
+    start = e.target.closest('.chart-box, .cat-chips, input, .popmenu, .night-pick') ? null : { x: e.clientX, y: e.clientY, t: performance.now() };
+  });
+  panel.addEventListener('pointercancel', () => { start = null; });
+  panel.addEventListener('pointerup', (e) => {
+    if (!start || !nightSwitch) return;
+    const dx = e.clientX - start.x, dy = e.clientY - start.y;
+    start = null;
+    if (Math.abs(dx) >= 60 && Math.abs(dx) > 1.5 * Math.abs(dy)) nightSwitch(dx < 0 ? 1 : -1);
+  });
+})();
 
 // ---------------------------------------------------------------- sound recognition
 // Uses Google's YAMNet sound-event model (521 sound classes) through MediaPipe Audio, running on the phone.

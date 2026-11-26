@@ -224,3 +224,6 @@ canvas { display: block; }
   .sheet::before, .sheet-panel, .sheet.open .sheet-panel, .popmenu, .session > :not(.s-actions), .night-ph { transition: none !important; }
   .night-ph > div { animation: none; }
 }
+
+/* night screen: horizontal swipes switch days (vertical scrolling of the lists still works) */
+#nightSheet .sheet-panel, #nightSheet .s-list-body { touch-action: pan-y; }
