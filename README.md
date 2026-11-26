@@ -59,7 +59,7 @@ The whole night is always recorded. When you open a night, the app identifies it
 - Chips above the **Sounds** list show how long each kind lasted. Tap one to highlight it on the graph and filter the list.
 - Each loud sound in the list is labelled with what it most likely is.
 
-The Android app has the model built in, so it works offline. The web version downloads it (about 26 MB) the first time.
+The Android app has the model built in, so it works offline, and it recognises the sounds **while recording**: the background service classifies the night as it goes (only the parts louder than the room's background, on a low-priority thread), so the result is ready when you stop and shows up live on the night's graph. If the model can't run on a phone, the app analyses the night afterwards as the web version does. The web version downloads the model (about 26 MB) the first time.
 
 ## Changing the threshold afterwards
 

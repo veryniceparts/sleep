@@ -1433,8 +1433,10 @@ const LiveRecog = {
 const Recog = {
   jobs: new Map(),          // night id -> { progress, done, result, error, listeners }
   queue: Promise.resolve(),
-  // a night needs (re)analysis unless it has a complete result of the current version
-  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION && !s.analysis.partial),
+  // a night needs (re)analysis unless it has a complete result of the current version. A "partial" result
+  // (recognised live while recording, in the browser or the Android app) counts as complete only while that
+  // night is still being recorded; if the recording was cut off, the night is analysed again afterwards.
+  needs: (s) => !(s.analysis && s.analysis.v === ANALYSIS_VERSION && !(s.analysis.partial && !s.live)),
   run(src, loaded) {
     const id = src.s.id;
     if (this.jobs.has(id)) return this.jobs.get(id);
