@@ -160,9 +160,61 @@ const WebMonitor = {
 
   async start({ record = settings.recordAll } = {}) {
     if (this.running) return;
-    this.stream = await navigator.mediaDevices.getUserMedia({
+    try {
+      await this.startInner(record);
+    } catch (e) {
+      // undo a half-started recorder (e.g. storage full): release the microphone and audio engine
+      this.running = false;
+      clearInterval(this.saveTimer); clearInterval(this.segTimer);
+      if (this.seg) { try { this.seg.rec.stop(); } catch {} this.seg = null; }
+      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+      if (this.ctx) this.ctx.close().catch(() => {});
+      this.session = null; this.live = null;
+      throw e;
+    }
+  },
+
+  getMic() {
+    return navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
     });
+  },
+
+  // Microphone lost (another app took it, device unplugged, iOS interruption): try to get it back and
+  // continue the same night; meanwhile the status shows a warning and the missing seconds become gaps.
+  watchMic(stream) {
+    stream.getAudioTracks().forEach((t) => {
+      t.onended = () => { if (this.running && this.stream === stream) this.recoverMic(); };
+      t.onmute = () => { if (this.stream === stream) this.micMuted = true; };
+      t.onunmute = () => { if (this.stream === stream) this.micMuted = false; };
+    });
+  },
+
+  async recoverMic() {
+    if (this.recovering) return;
+    this.recovering = true; this.micLost = true;
+    for (let i = 0; this.running && i < 30; i++) {
+      try {
+        const stream = await this.getMic();
+        if (!this.running) { stream.getTracks().forEach((t) => t.stop()); break; }
+        try { this.src.disconnect(); } catch {}
+        this.stream.getTracks().forEach((t) => t.stop());
+        this.stream = stream;
+        this.src = this.ctx.createMediaStreamSource(stream);
+        this.src.connect(this.proc); this.src.connect(this.analyser);
+        this.watchMic(stream);
+        if (this.seg) this.rotateSegment(); // the old recorder died with the old stream
+        this.micLost = false;
+        break;
+      } catch { await new Promise((r) => setTimeout(r, 2000 * Math.min(5, i + 1))); }
+    }
+    this.recovering = false;
+  },
+
+  async startInner(record) {
+    this.micLost = false; this.micMuted = false;
+    this.stream = await this.getMic();
+    this.watchMic(this.stream);
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC();
     await this.ctx.resume();
@@ -189,8 +241,8 @@ const WebMonitor = {
       segments: [],    // whole-night recording: { id, start, duration, mime, size } (audio in segments store)
     };
     Object.assign(this, { preBuf: [], preLen: 0, clip: null, secMax: 0, secSamples: 0 });
+    await DB.putSession(this.session); // fails early (e.g. storage full) before anything is running
     this.running = true;
-    await DB.putSession(this.session);
     this.live = LiveRecog.start(this.session);
     this.saveTimer = setInterval(() => this.persist(), 30000);
     if (record) this.setRecordAll(true);
@@ -215,10 +267,21 @@ const WebMonitor = {
     try {
       rec = new MediaRecorder(this.stream, FULL_MIME ? { mimeType: FULL_MIME, audioBitsPerSecond: FULL_BITRATE } : { audioBitsPerSecond: FULL_BITRATE });
     } catch (e) { console.error('MediaRecorder failed', e); this.seg = null; return; }
-    const g = { rec, chunks: [], size: 0, start: Date.now(), end: 0, mime: rec.mimeType || FULL_MIME || 'audio/webm', session: this.session };
+    const start = Date.now();
+    const g = { rec, chunks: [], size: 0, start, end: 0, mime: rec.mimeType || FULL_MIME || 'audio/webm', session: this.session, live: this.live,
+      meta: { id: 'g' + start, start, duration: 0, mime: rec.mimeType || FULL_MIME || 'audio/webm', size: 0, partial: true } };
     g.done = new Promise((res) => { rec.onstop = () => this.saveSegment(g).then(res, res); });
-    rec.ondataavailable = (e) => { if (e.data && e.data.size) { g.chunks.push(e.data); g.size += e.data.size; } };
-    rec.onstart = () => { g.start = Date.now(); };
+    rec.ondataavailable = (e) => {
+      if (!e.data || !e.data.size) return;
+      g.chunks.push(e.data); g.size += e.data.size;
+      // store what we have so far (every 10 s), so a reload or crash loses at most 10 s of audio
+      if (g.saved) return;
+      g.meta.duration = +((Date.now() - g.start) / 1000).toFixed(1); g.meta.size = g.size;
+      if (!g.session.segments.includes(g.meta)) g.session.segments.push(g.meta);
+      DB.putSegment({ ...g.meta, sessionId: g.session.id, blob: new Blob(g.chunks, { type: g.mime }) }).catch(() => {});
+    };
+    rec.onstart = () => { g.start = g.meta.start = Date.now(); };
+    rec.onerror = (e) => { console.warn('recorder error', e); if (this.seg === g && this.running) this.rotateSegment(); };
     rec.start(10000);
     this.seg = g;
   },
@@ -240,18 +303,20 @@ const WebMonitor = {
     g.saved = true;
     const blob = new Blob(g.chunks, { type: g.mime });
     const end = g.end || Date.now();
-    const meta = { id: 'g' + g.start, start: g.start, duration: +((end - g.start) / 1000).toFixed(1), mime: g.mime, size: blob.size };
-    g.session.segments.push(meta);
+    const meta = g.meta; // the same entry that was stored while recording, now complete
+    Object.assign(meta, { start: g.start, duration: +((end - g.start) / 1000).toFixed(1), size: blob.size });
+    delete meta.partial;
+    if (!g.session.segments.includes(meta)) g.session.segments.push(meta);
     try {
       await DB.putSegment({ ...meta, sessionId: g.session.id, blob });
       await DB.putSession(g.session);
-    } catch (e) { console.error('segment save failed', e); }
-    if (this.live && this.live.session === g.session) LiveRecog.add(this.live, meta, blob);
+    } catch (e) { console.error('segment save failed', e); meta.saveError = true; }
+    if (g.live) LiveRecog.add(g.live, meta, blob); // (also after Stop, if this file finished late)
   },
 
   fullBytes() {
     if (!this.session) return 0;
-    return this.session.segments.reduce((n, g) => n + g.size, 0) + (this.seg ? this.seg.size : 0);
+    return this.session.segments.reduce((n, g) => n + (g === (this.seg && this.seg.meta) ? 0 : g.size), 0) + (this.seg ? this.seg.size : 0);
   },
 
   async stop() {
@@ -282,6 +347,7 @@ const WebMonitor = {
   },
 
   process(input, rate) {
+    if (!this.running) return; // stopping: don't start new clips or levels
     const now = Date.now();
     let sum = 0;
     for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
@@ -314,7 +380,7 @@ const WebMonitor = {
       const dur = this.clip.len / CLIP_RATE;
       if (now - this.clip.lastLoud >= s.postRoll * 1000 || dur >= s.maxClip) this.finishClip();
     } else if (loud) {
-      this.startClip(now, 'loud');
+      this.startClip(now, 'loud', chunk.length);
       this.clip.chunks.push(chunk); this.clip.len += chunk.length; this.clip.peak = level;
     } else {
       this.preBuf.push(chunk); this.preLen += chunk.length;
@@ -324,8 +390,9 @@ const WebMonitor = {
     }
   },
 
-  startClip(now, tag) {
-    const preSec = this.preLen / CLIP_RATE;
+  // `curLen`: samples of the buffer that triggered the clip (it ends at `now`)
+  startClip(now, tag, curLen = 0) {
+    const preSec = (this.preLen + curLen) / CLIP_RATE;
     this.clip = { start: now - preSec * 1000, chunks: this.preBuf, len: this.preLen, peak: 0, lastLoud: now, tag };
     this.preBuf = []; this.preLen = 0;
   },
@@ -603,7 +670,7 @@ function updateStatus() {
   let state, info;
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
-    state = Monitor.clip ? '● Recording sound' : 'Monitoring';
+    state = Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound' : 'Monitoring';
     info = `${fmtDur(Date.now() - s.start)} · ${s.clips.length} loud sounds`;
     setText('nightInfo', `${s.clips.length} loud sounds`);
   } else if (Preview.on || Preview.starting) { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
@@ -1452,6 +1519,11 @@ const LiveRecog = {
       try {
         const wins = await Analyzer.analyzeWins([{ ...meta, blob }], () => {}, () => false, activeSpans(L.session), 2);
         L.wins.push(...wins);
+        if (L.finished) { // a file that finished after Stop: update the stored final result
+          L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
+          await DB.putSession(L.session).catch(() => {});
+          return;
+        }
         L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), partial: true, runs: mergeRuns(L.wins.slice()) };
       } catch (e) {
         console.warn('live recognition stopped', e);
@@ -1465,7 +1537,8 @@ const LiveRecog = {
     const id = L.session.id;
     const p = L.queue.then(async () => {
       if (L.failed) return;
-      L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins) };
+      L.finished = true;
+      L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
       await DB.putSession(L.session).catch(() => {});
     }).finally(() => this.pending.delete(id));
     this.pending.set(id, p);
@@ -1489,9 +1562,10 @@ const Recog = {
     this.jobs.set(id, job);
     this.queue = this.queue.catch(() => {}).then(async () => {
       // a night just recorded in the browser may still be finishing its live analysis: use that instead
-      if (LiveRecog.pending.has(id)) { await LiveRecog.pending.get(id); loaded = await src.load(); }
-      if (loaded && !Recog.needs(loaded.s)) { src.s.analysis = job.result = loaded.s.analysis; return; }
-      const d = loaded || await src.load();
+      if (LiveRecog.pending.has(id)) { await LiveRecog.pending.get(id); loaded = null; }
+      if (!loaded) loaded = await src.load(); // fresh data: it may have been analysed meanwhile
+      if (!Recog.needs(loaded.s)) { src.s.analysis = job.result = loaded.s.analysis; return; }
+      const d = loaded;
       const items = d.segs.length ? d.segs : d.clips;
       if (job.cancelled) return;
       const res = items.length ? await Analyzer.analyze(items, (f) => { job.progress = f; notify(); }, () => job.cancelled, activeSpans(d.s)) : null;
@@ -2259,6 +2333,7 @@ setRunningUI(false);
 Meter.start();
 renderWeek().then(() => setTimeout(autoRecognise, 3000));
 refreshState();
+window.addEventListener('pagehide', () => { if (WebMonitor.running) { if (WebMonitor.clip) WebMonitor.finishClip(); WebMonitor.persist(); } });
 window.addEventListener('beforeunload', (e) => { if (Monitor.running && !USE_NATIVE) { Monitor.persist(); e.preventDefault(); e.returnValue = ''; } });
 if ('serviceWorker' in navigator && location.protocol !== 'file:' && !NATIVE) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
