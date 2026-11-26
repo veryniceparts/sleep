@@ -30,10 +30,19 @@ class AacWriter {
         fmt.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, 32000);
         fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
-        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-        codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-        codec.start();
-        muxer = new MediaMuxer(file.getPath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        MediaCodec c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+        try {
+            c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            c.start();
+            muxer = new MediaMuxer(file.getPath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        } catch (IOException | RuntimeException e) {
+            // don't leak the encoder (a hardware resource) when the muxer or the codec setup fails
+            try { c.stop(); } catch (Exception ignored) { }
+            try { c.release(); } catch (Exception ignored) { }
+            file.delete();
+            throw e;
+        }
+        codec = c;
     }
 
     private long pts() { return samples * 1_000_000L / SleepService.RATE; }
@@ -86,7 +95,11 @@ class AacWriter {
         }
     }
 
-    /** Finishes the file and returns its size in bytes (0 if nothing was written). */
+    /**
+     * Finishes the file and returns its size in bytes (0 if nothing was written). Can take a moment (drains the
+     * encoder): SleepService calls it on its file thread, not on the audio thread. write() may throw
+     * MediaCodec.CodecException / IllegalStateException; the caller handles that and still calls finish().
+     */
     long finish() {
         try {
             int idx = codec.dequeueInputBuffer(100_000);
@@ -96,7 +109,7 @@ class AacWriter {
             Log.w(TAG, "finish drain failed", e);
         }
         try { codec.stop(); } catch (Exception ignored) { }
-        codec.release();
+        try { codec.release(); } catch (Exception ignored) { }
         boolean ok = muxing;
         try { if (muxing) muxer.stop(); } catch (Exception e) { ok = false; Log.w(TAG, "muxer stop failed", e); }
         try { muxer.release(); } catch (Exception ignored) { }
