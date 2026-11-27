@@ -1940,6 +1940,10 @@ class NightView {
   // previous / next loud sound (of the selected category)
   targetSound(dir) {
     const list = this.soundList(), t = this.curT();
+    // step from the selected sound while we're playing it (playback starts 1.5 s before a sound, so going by time alone
+    // would find the same sound again)
+    const k = this.selSound ? list.indexOf(this.selSound) : -1;
+    if (k >= 0 && (t === null || (t >= this.selSound.s - 3000 && t <= this.selSound.e + 1000))) return list[k + dir] || null;
     if (t === null) return dir > 0 ? list[0] || null : null;
     if (dir > 0) return list.find((x) => x.s > t + 1000) || null;
     for (let i = list.length - 1; i >= 0; i--) if (list[i].s < t - 3000) return list[i];
