@@ -2,7 +2,8 @@
 // (so recognition works offline in the app). The web version loads those from a CDN instead.
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
-const files = ['index.html', 'styles.css', 'version.js', 'app.js', 'sw.js', 'manifest.webmanifest', 'icon.svg'];
+const files = ['index.html', 'styles.css', 'version.js', 'app.js', 'sw.js', 'manifest.webmanifest', 'icon.svg',
+  'apple-touch-icon.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'];
 rmSync('www', { recursive: true, force: true });
 mkdirSync('www');
 for (const f of files) cpSync(f, `www/${f}`);

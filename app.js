@@ -21,10 +21,14 @@ const LIVE_SECONDS = 60;     // live chart window (s)
 const SEGMENT_MS = 10 * 60 * 1000; // whole-night recording is saved in 10-minute files
 const FULL_BITRATE = 32000;  // bits/s for whole-night recording (~14 MB per hour)
 
-// best compressed format this browser can record (webm/opus on Chrome/Android, mp4/aac on Safari)
+// best compressed format this browser can record (webm/opus on Chrome/Android, mp4/aac on Safari).
+// Safari (and every iOS browser, all WebKit) may also claim WebM, but only plays mp4 back reliably: prefer mp4 there.
+const WEBKIT = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+  (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Android/.test(navigator.userAgent));
 const FULL_MIME = (() => {
   if (!window.MediaRecorder) return null;
-  const opts = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'];
+  const opts = WEBKIT ? ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+    : ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'];
   return opts.find((m) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || '';
 })();
 const fmtMB = (bytes) => { const mb = bytes / 1e6; return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`; };
@@ -481,8 +485,11 @@ const Monitor = USE_NATIVE ? NativeMonitor : WebMonitor;
 const $ = (id) => document.getElementById(id);
 const pad = (n) => String(n).padStart(2, '0');
 const fmtDur = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 3600)}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`; };
-const fmtTime = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-const fmtDate = (t) => new Date(t).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+// 12-hour locales write 9:05 PM (a forced '2-digit' hour gives 09:05 PM); 24-hour ones keep 09:05
+const HOUR = /h1[12]/.test(new Intl.DateTimeFormat([], { hour: 'numeric' }).resolvedOptions().hourCycle || '') ? 'numeric' : '2-digit';
+const fmtTime = (t) => new Date(t).toLocaleTimeString([], { hour: HOUR, minute: '2-digit', second: '2-digit' });
+const fmtDate = (t) => new Date(t).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: HOUR, minute: '2-digit' });
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`; // plural(1, 'loud sound') = '1 loud sound'
 const rate = (n, ms) => (ms >= 600000 ? (n / (ms / 3600000)).toFixed(1) : '–');
 const fileStamp = (t) => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; };
 
@@ -539,15 +546,17 @@ const yOf = (db, h) => h - ((Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / 
 // ---------------------------------------------------------------- live level preview
 // The meter works as soon as the app opens (before Start). Nothing is recorded: the microphone only feeds
 // an analyser that the meter reads every screen frame.
+let monitorStarting = false; // Start was tapped: the recorder is getting the microphone, the preview must not take it
 const Preview = {
-  on: false, starting: null,
+  on: false, starting: null, unlock: null,
   start() {
-    if (this.on || this.starting || Monitor.running || document.visibilityState !== 'visible') return this.starting || Promise.resolve();
+    if (this.on || this.starting || Monitor.running || monitorStarting || document.visibilityState !== 'visible') return this.starting || Promise.resolve();
     this.starting = (async () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
       });
-      if (Monitor.running || document.visibilityState !== 'visible') { stream.getTracks().forEach((t) => t.stop()); return; }
+      // the permission prompt can stay up a long time: Start may have been tapped (or the page hidden) meanwhile
+      if (Monitor.running || monitorStarting || document.visibilityState !== 'visible') { stream.getTracks().forEach((t) => t.stop()); return; }
       const AC = window.AudioContext || window.webkitAudioContext;
       const ctx = new AC();
       const src = ctx.createMediaStreamSource(stream);
@@ -556,15 +565,23 @@ const Preview = {
       src.connect(analyser);
       Object.assign(this, { ctx, stream, src, analyser, on: true });
       if (ctx.state === 'suspended') {
-        // browsers only allow audio after a tap
+        // browsers only allow audio after a tap. pointerdown is not a user gesture for touch input, so listen for
+        // the end of the tap too, and keep listening until the audio really runs
         ctx.resume().catch(() => {});
-        const resume = () => { ctx.resume().catch(() => {}); window.removeEventListener('pointerdown', resume, true); };
-        window.addEventListener('pointerdown', resume, true);
+        const EVENTS = ['pointerup', 'click', 'touchend', 'keydown'];
+        const off = () => { EVENTS.forEach((ev) => window.removeEventListener(ev, resume, true)); if (this.unlock === off) this.unlock = null; };
+        const resume = () => {
+          if (ctx.state === 'closed') { off(); return; }
+          ctx.resume().then(() => { if (ctx.state === 'running') off(); }, () => {});
+        };
+        EVENTS.forEach((ev) => window.addEventListener(ev, resume, true));
+        this.unlock = off;
       }
     })().finally(() => { this.starting = null; });
     return this.starting;
   },
   stop() {
+    if (this.unlock) this.unlock();
     if (!this.on) return;
     this.on = false;
     try { this.src.disconnect(); } catch {}
@@ -582,13 +599,24 @@ function startPreview() {
 }
 
 // ---------------------------------------------------------------- monitor UI
-let wakeLock = null;
+// In the browser, a locked screen suspends the page and stops the recording, so the screen must stay on.
+// Without the Wake Lock API (e.g. iPhone home-screen apps before iOS 18.4), or when it fails or is released,
+// the status warns the user to keep the screen on.
+let wakeLock = null, wakeWarn = false;
 async function keepAwake() {
   if (USE_NATIVE) return; // the native service keeps running with the screen off
-  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  if (!('wakeLock' in navigator)) { wakeWarn = true; return; }
+  if (wakeLock && !wakeLock.released) { wakeWarn = false; return; }
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (!Monitor.running) { lock.release().catch(() => {}); return; }
+    wakeLock = lock; wakeWarn = false;
+    lock.addEventListener('release', () => { if (wakeLock === lock) { wakeLock = null; if (Monitor.running) wakeWarn = true; } });
+  } catch { wakeWarn = true; }
 }
 function allowSleep() {
-  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  wakeWarn = false;
+  if (wakeLock) { const l = wakeLock; wakeLock = null; l.release().catch(() => {}); }
 }
 
 function updateThresholdUI() {
@@ -678,9 +706,11 @@ function updateStatus() {
   if (Monitor.saving) { setText('stState', 'Saving the night…'); setText('stInfo', 'Writing the last recording, a few seconds'); return; }
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
-    state = Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound' : 'Monitoring';
-    info = `${fmtDur(Date.now() - s.start)} · ${s.clips.length} loud sounds`;
-    setText('nightInfo', `${s.clips.length} loud sounds`);
+    state = Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound'
+      : wakeWarn && !USE_NATIVE ? '⚠ Keep the screen on' : 'Monitoring';
+    $('stState').title = wakeWarn && !USE_NATIVE ? 'This browser can\'t keep the screen on. If the screen locks, recording stops: keep it on (plugged in) and this page open.' : '';
+    info = `${fmtDur(Date.now() - s.start)} · ${plural(s.clips.length, 'loud sound')}`;
+    setText('nightInfo', plural(s.clips.length, 'loud sound') + (wakeWarn && !USE_NATIVE ? ' · keep the screen on' : ''));
   } else if (Preview.on || Preview.starting) { state = 'Live level'; info = lastSaved || 'Not recording · tap Start'; }
   else return; // keep the "microphone blocked" message
   setText('stState', state);
@@ -699,20 +729,31 @@ function setRunningUI(on) {
   $('btnNight').disabled = !on;
 }
 
+// taps on Start/Stop right after it changed state are ignored: a quick double tap would otherwise start
+// and at once stop (and save) an empty night
+const TOGGLE_GUARD_MS = 1000;
+let toggleBusy = false, toggleQuietUntil = 0;
 $('btnToggle').onclick = async () => {
   const b = $('btnToggle');
+  if (toggleBusy || performance.now() < toggleQuietUntil) return;
+  toggleBusy = true;
   b.disabled = true;
   try {
     if (!Monitor.running) {
-      Preview.stop(); // free the microphone for the recorder
-      Recog.cancelAll(); // and the CPU
+      monitorStarting = true; // a preview still waiting for the microphone (permission prompt) gives up
       try {
+        if (Preview.starting) await Preview.starting.catch(() => {});
+        Preview.stop(); // free the microphone for the recorder
+        Recog.cancelAll(); // and the CPU
         await Monitor.start();
       } catch (e) {
+        monitorStarting = false;
         alert('Could not start monitoring: ' + e.message + (USE_NATIVE ? '' : '\n\nThe page must be opened over https and microphone access allowed.'));
         startPreview();
         return;
       }
+      monitorStarting = false;
+      markNightsDirty();
       lastSaved = '';
       keepAwake();
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
@@ -722,6 +763,7 @@ $('btnToggle').onclick = async () => {
     } else {
       let s = null;
       try { s = await Monitor.stop(); } catch (e) { alert('Stop failed: ' + e.message); }
+      markNightsDirty();
       setRunningUI(false);
       allowSleep();
       if (s) lastSaved = `Saved ${fmtDur(s.end - s.start)} · ${s.clips.length} loud sounds`;
@@ -730,14 +772,26 @@ $('btnToggle').onclick = async () => {
       autoRecognise();
     }
   } finally {
+    toggleBusy = false;
+    toggleQuietUntil = performance.now() + TOGGLE_GUARD_MS;
     b.disabled = false;
   }
 };
 
+function exitNightMode() {
+  $('nightOverlay').hidden = true; clearInterval(nightClockTimer);
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+
 // monitoring was stopped from the notification's Stop button
 async function onStoppedElsewhere() {
   if (Monitor.error) lastSaved = `Recording stopped: ${Monitor.error}`;
+  markNightsDirty();
   setRunningUI(false);
+  allowSleep();
+  exitNightMode();
+  // a night screen still showing the recording as live: show the finished night instead
+  if (nightShownLive && layers.includes($('nightSheet'))) closeSheets();
   startPreview();
   await renderWeek();
   autoRecognise();
@@ -745,18 +799,21 @@ async function onStoppedElsewhere() {
 
 $('btnCalibrate').onclick = async () => {
   closeSheets();
+  if (calib) return; // already measuring
+  const vals = calib = []; // this run's samples (updateStatus adds to it every ~150 ms)
   if (!Monitor.running && !Preview.on) {
-    try { await Preview.start(); } catch (e) { alert('Microphone error: ' + e.message); return; }
+    try { await Preview.start(); } catch (e) { calib = null; alert('Microphone error: ' + e.message); return; }
   }
   if (Preview.ctx && Preview.ctx.state !== 'running') await Preview.ctx.resume().catch(() => {});
-  calib = [];
+  vals.length = 0; // count only from when the microphone runs
   await new Promise((r) => setTimeout(r, 10000));
-  const vals = calib.sort((a, b) => a - b);
-  calib = null;
+  if (calib === vals) calib = null;
   if (!vals.length) return;
-  settings.threshold = Math.min(100, Math.max(20, Math.round(vals[Math.floor(vals.length * 0.9)] + 15)));
+  vals.sort((a, b) => a - b);
+  const want = Math.round(vals[Math.floor(vals.length * 0.9)] + 15);
+  settings.threshold = Math.min(100, Math.max(20, want));
   saveSettings(); updateThresholdUI();
-  lastSaved = `Threshold set to ${settings.threshold} dB (room + 15)`;
+  lastSaved = `Threshold set to ${settings.threshold} dB` + (want > 100 ? ' (maximum: the room is loud)' : want < 20 ? ' (minimum)' : ' (room + 15)');
 };
 
 function updateRecordAllInfo() {
@@ -780,17 +837,14 @@ let nightClockTimer;
 $('btnNight').onclick = () => {
   closeSheets();
   $('nightOverlay').hidden = false;
-  const tick = () => { $('nightClock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); };
+  const tick = () => { $('nightClock').textContent = hm(Date.now()); };
   tick(); nightClockTimer = setInterval(tick, 10000);
   if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
 };
 let lastTap = 0;
 $('nightOverlay').addEventListener('click', () => {
   const now = Date.now();
-  if (now - lastTap < 400) {
-    $('nightOverlay').hidden = true; clearInterval(nightClockTimer);
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  }
+  if (now - lastTap < 400) exitNightMode();
   lastTap = now;
 });
 
@@ -811,20 +865,28 @@ function afterTransition(el, fn) {
 }
 function showLayer(el) {
   const tok = el._anim = {};
+  el._ready = false; // until it is fully in, a tap on its backdrop is the 2nd tap of what opened it
   el.hidden = false;
   void el.offsetWidth; // start from the closed state so the transition runs
   el.classList.add('open');
-  return new Promise((resolve) => afterTransition(el, () => resolve(el._anim === tok)));
+  return new Promise((resolve) => afterTransition(el, () => { if (el._anim === tok) el._ready = true; resolve(el._anim === tok); }));
 }
 function hideLayer(el, then) {
   if (el.hidden) { if (then) then(); return; }
   const tok = el._anim = {};
+  el._ready = false;
   if (el.contains(document.activeElement)) document.activeElement.blur(); // commits a half-typed setting
   el.classList.remove('open');
   afterTransition(el, () => { if (el._anim !== tok) return; el.hidden = true; if (then) then(); });
 }
+const isMenu = (el) => !!el && el.classList.contains('popmenu');
 function openLayer(el, replace = false) {
   if (layers.includes(el)) return Promise.resolve(true);
+  if (el.classList.contains('sheet') && isMenu(topLayer())) {
+    // a sheet opened while a ⋮ menu is up replaces the menu (its history entry becomes the sheet's)
+    replace = replace || histDepth === layers.length;
+    hideLayer(layers.pop());
+  }
   layers.push(el);
   if (el.classList.contains('sheet')) el.style.zIndex = 20 + layers.length; // later sheets on top
   const st = { layer: el.id || 'menu', depth: layers.length };
@@ -837,8 +899,11 @@ function dropLayer(el) {
   const i = layers.indexOf(el);
   if (i < 0) return;
   layers.splice(i, 1);
-  if (el.id === 'nightSheet') { hideLayer(el, () => { if (!layers.includes(el)) closeNight(); }); renderWeek(); }
-  else hideLayer(el);
+  if (el.id === 'nightSheet') {
+    renderWeek(false); // cheap: the week the night was in (day swipes) is shown as it slides out
+    // reloading the nights (only if they changed) waits until the slide-out is over, so it doesn't stutter
+    hideLayer(el, () => { if (!layers.includes(el)) { closeNight(); if (nightsDirty) renderWeek(); } });
+  } else hideLayer(el);
 }
 // depth of our history entries once queued back navigations are done (each open layer has one)
 let histDepth = 0;
@@ -851,6 +916,8 @@ function closeTop() {
   dropLayer(top); // right away, so code running next sees the new stack (popstate then finds nothing to do)
 }
 function closeSheets() {
+  // closing everything from a night (e.g. after "Delete night"): its data may have changed
+  if (layers.includes($('nightSheet'))) markNightsDirty();
   const n = Math.min(layers.length, histDepth);
   while (layers.length) dropLayer(layers[layers.length - 1]);
   if (n > 0) goBack(n);
@@ -861,16 +928,25 @@ window.addEventListener('popstate', () => {
   while (layers.length > histDepth) dropLayer(layers[layers.length - 1]);
 });
 if (stateDepth()) history.replaceState(null, ''); // reloaded with a sheet open: start from the main screen
+// Taps on a sheet's backdrop close it, but only when the tap started and ended on the backdrop of the fully
+// opened top sheet: while a sheet still slides in, the 2nd tap of a double tap would otherwise close it at once.
+// Each ✕/‹ closes its own sheet only (a double tap on it must not also close the layer underneath).
 document.querySelectorAll('.sheet').forEach((sh) => {
-  sh.addEventListener('click', (e) => { if (e.target === sh && layers[layers.length - 1] === sh) closeTop(); });
-  sh.querySelector('.sheet-close').onclick = closeTop;
+  let downOnBackdrop = false;
+  sh.addEventListener('pointerdown', (e) => { downOnBackdrop = e.target === sh && sh._ready; });
+  sh.addEventListener('click', (e) => {
+    const ok = downOnBackdrop && e.target === sh && sh._ready && topLayer() === sh;
+    downOnBackdrop = false;
+    if (ok) closeTop();
+  });
+  sh.querySelector('.sheet-close').onclick = () => { if (topLayer() === sh) closeTop(); };
 });
 
 // ⋮ menus: the top bar's (#appMenu) and the night screen's (.s-actions of the shown night)
 const topLayer = () => layers[layers.length - 1];
 function toggleMenu(menu) {
   if (topLayer() === menu) closeTop();
-  else if (menu && !layers.includes(menu)) { if (topLayer() && topLayer().classList.contains('popmenu')) closeTop(); openLayer(menu); }
+  else if (menu && !layers.includes(menu)) { if (isMenu(topLayer())) closeTop(); openLayer(menu); }
 }
 // a menu item: Settings/About replace the menu (Back then returns to what was below it); others just close it
 function onMenuClick(menu, e) {
@@ -878,22 +954,31 @@ function onMenuClick(menu, e) {
   if (!b || topLayer() !== menu) return;
   const target = b.dataset.open && $(b.dataset.open);
   if (!target) { closeTop(); return; }
-  const replace = histDepth === layers.length;
-  layers.pop(); hideLayer(menu); // its history entry becomes the sheet's
   if (target.id === 'menuSheet') fillSettings();
   updateStorageInfo();
-  openLayer(target, replace);
+  openLayer(target); // replaces the menu
 }
 function wireMenu(menu) {
   menu.addEventListener('click', (e) => onMenuClick(menu, e));
 }
 wireMenu($('appMenu'));
 $('btnMenu').onclick = (e) => { e.stopPropagation(); toggleMenu($('appMenu')); };
-// tapping anywhere outside an open menu closes it
-document.addEventListener('click', (e) => {
-  const m = topLayer();
-  if (m && m.classList.contains('popmenu') && !m.contains(e.target)) closeTop();
-});
+// A tap anywhere outside an open ⋮ menu only closes the menu: it is swallowed (capture phase, before anything
+// below sees it), so it doesn't also open a night, switch the week, play a sound, ...
+(() => {
+  let swallow = false;
+  const outside = (e) => isMenu(topLayer()) && !topLayer().contains(e.target);
+  window.addEventListener('pointerdown', (e) => {
+    swallow = outside(e);
+    if (swallow) { e.stopPropagation(); closeTop(); }
+  }, true);
+  window.addEventListener('pointerup', (e) => { if (swallow) e.stopPropagation(); }, true);
+  window.addEventListener('click', (e) => {
+    if (outside(e)) { swallow = true; closeTop(); } // e.g. keyboard "clicks" (no pointerdown)
+    if (swallow) { e.stopPropagation(); e.preventDefault(); }
+    swallow = false;
+  }, true);
+})();
 $('appVersion').textContent = window.APP_VERSION || 'dev';
 if (NATIVE) $('linkReleases').removeAttribute('target'); // the app opens external links in the browser
 
@@ -995,8 +1080,8 @@ async function mountNight(el, src) {
     const dur = (live ? Date.now() : s.end) - s.start;
     const snore = snoreMs(s);
     const ns = view.sessions.length;
-    return `${fmtDur(dur)} · ${view.sounds.length} loud sounds` +
-      (snore !== null ? ` · snoring ${fmtSnore(snore)}${ns ? ` in ${ns} session${ns === 1 ? '' : 's'}` : ''}` : '') +
+    return `${fmtDur(dur)} · ${plural(view.sounds.length, 'loud sound')}` +
+      (snore === null ? '' : snore ? ` · snoring ${fmtSnore(snore)}${ns ? ` in ${plural(ns, 'session')}` : ''}` : ' · no snoring') +
       (view.segs.length ? ` · ${fmtMB(segBytes(s))}` : '');
   };
   let d;
@@ -1117,6 +1202,11 @@ async function mountNight(el, src) {
 let allNights = [];   // sources (see idbSource / nativeSource)
 let weekOffset = 0;   // 0 = this week, -1 = last week, ...
 let nightView = null;
+// Reading every night (with its full levels) is slow with many nights, so renderWeek() only reloads them when
+// they may have changed. Code that adds, removes or replaces saved nights calls markNightsDirty().
+// (Changes made to a night's source object in place, e.g. a saved analysis, show without a reload.)
+let nightsDirty = true;
+function markNightsDirty() { nightsDirty = true; }
 
 async function loadNights() {
   const sources = (await DB.getSessions()).map(idbSource);
@@ -1131,13 +1221,15 @@ async function loadNights() {
 
 // a night belongs to the evening it started on (a start at 01:30 counts as the previous night)
 const nightDay = (t) => { const d = new Date(t - 12 * 3600e3); d.setHours(0, 0, 0, 0); return d.getTime(); };
+// Monday of this week (offset 0) or an earlier one. Days run noon to noon like nightDay(), so on Monday morning
+// (or after midnight while Sunday night is being recorded) "this week" is still the week of last night.
 function weekStart(offset) {
-  const d = new Date(); d.setHours(0, 0, 0, 0);
+  const d = new Date(nightDay(Date.now()));
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + offset * 7); // Monday
   return d;
 }
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
-const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const hm = (t) => new Date(t).toLocaleTimeString([], { hour: HOUR, minute: '2-digit' });
 const durShort = (ms) => { const m = Math.round(ms / 60000); return m >= 60 ? `${Math.floor(m / 60)}h${pad(m % 60)}` : `${m}m`; };
 const nightEnd = (src) => (src.live ? Date.now() : src.s.end);
 // snoring recognised in a night, in ms (null = not analysed yet)
@@ -1175,10 +1267,12 @@ function drawSpark(cv, src) {
 }
 
 let reloadSeq = 0;
+// reload: read the nights again if they changed (see markNightsDirty); false: just redraw
 async function renderWeek(reload = true) {
-  if (reload) {
+  if (reload && nightsDirty) {
     const seq = ++reloadSeq;
-    await loadNights();
+    nightsDirty = false;
+    try { await loadNights(); } catch (e) { nightsDirty = true; throw e; }
     if (seq !== reloadSeq) return; // a newer reload is on its way and will draw
   }
   const ws = weekStart(weekOffset), we = addDays(ws, 7);
@@ -1190,7 +1284,7 @@ async function renderWeek(reload = true) {
 
   const grid = $('weekGrid');
   grid.innerHTML = '';
-  const today = nightDay(Date.now() + 12 * 3600e3), inWeek = [];
+  const today = nightDay(Date.now()), inWeek = []; // the night we are in (until noon: last night)
   const sparks = [];
   for (let i = 0; i < 7; i++) {
     const day = addDays(ws, i).getTime();
@@ -1206,7 +1300,8 @@ async function renderWeek(reload = true) {
       const dur = nightEnd(main) - main.s.start, sn = snoreMs(main.s);
       html += `<div class="t-time">${hm(main.s.start)}</div><canvas></canvas>` +
         `<div class="t-time">${durShort(dur)}</div>` +
-        `<div class="t-rate snore" data-night="${main.s.id}">${sn === null ? '' : sn ? `snore ${fmtSnore(sn)}` : 'no snoring'}</div>`;
+        `<div class="t-rate snore" data-night="${main.s.id}"${sn === null ? '' : ` title="${sn ? `snoring ${fmtSnore(sn)}` : 'no snoring'}"` +
+          ` data-short="${sn ? fmtSnore(sn) : 'no snore'}"`}>${sn === null ? '' : sn ? `snore ${fmtSnore(sn)}` : 'no snoring'}</div>`;
       el.onclick = () => openNight(list, list.indexOf(main));
     } else {
       html += `<div class="t-time">${day > today ? '' : '—'}</div>`;
@@ -1229,14 +1324,19 @@ async function renderWeek(reload = true) {
     `<div class="t-time">snoring avg</div>` +
     `<div class="t-rate snore"><b>${snoreAvg === null ? '–' : fmtSnore(snoreAvg)}</b></div>`;
   grid.appendChild(sum);
-  requestAnimationFrame(() => sparks.forEach(([cv, src]) => drawSpark(cv, src)));
+  requestAnimationFrame(() => {
+    sparks.forEach(([cv, src]) => drawSpark(cv, src));
+    // too narrow for "snore 1h05" (small phones): show the short form instead of cutting it off
+    grid.querySelectorAll('.t-rate[data-short]').forEach((el) => { if (el.scrollWidth > el.clientWidth + 0.5) el.textContent = el.dataset.short; });
+  });
   grid.querySelectorAll('[data-night]').forEach((el) => {
     const job = Recog.jobs.get(el.dataset.night);
     if (!job) return;
     const f = (j) => {
       if (!el.isConnected) { j.listeners.delete(f); return; }
       if (j.done) { j.listeners.delete(f); setTimeout(() => renderWeek(false), 0); return; }
-      setTextEl(el, `recognising ${Math.round(j.progress * 100)}%`);
+      setTextEl(el, `⋯ ${Math.round(j.progress * 100)}%`); // recognising (short: tiles are narrow)
+      el.title = 'Recognising sounds';
     };
     job.listeners.add(f); f(job);
   });
@@ -1281,6 +1381,7 @@ const NIGHT_PLACEHOLDER = '<div class="ph-line"></div><div class="ph-tools"></di
   '<div class="ph-player"></div><div class="ph-list"></div>';
 let showSeq = 0;
 let nightSwitch = null; // set while a night is open: switches to the previous/next recorded day
+let nightShownLive = false; // the open night is the one being recorded
 const mainIndex = (list) => list.reduce((bi, n, i) => (nightEnd(n) - n.s.start > nightEnd(list[bi]) - list[bi].s.start ? i : bi), 0);
 function openNight(list, idx) {
   const opened = openSheet($('nightSheet'));
@@ -1305,6 +1406,7 @@ function openNight(list, idx) {
     if (topLayer() && topLayer().classList.contains('popmenu')) closeTop();
     closeNight();
     const src = list[i];
+    nightShownLive = !!src.live;
     $('nightTitle').textContent = fmtDate(src.s.start) + (src.live ? ' · recording' : '');
     if (list.length > 1) {
       list.forEach((n, j) => {
@@ -2328,13 +2430,18 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     refreshState();
     if (Monitor.running) keepAwake();
+    if (USE_NATIVE) markNightsDirty(); // the background service may have saved or updated nights meanwhile
     renderWeek();
   } else {
     Preview.stop(); // don't hold the microphone in the background just for the meter
   }
 });
 // keep today's tile up to date during the night
-setInterval(() => { if (Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden) renderWeek(USE_NATIVE); }, 60000);
+setInterval(() => {
+  if (!(Monitor.running && document.visibilityState === 'visible' && $('nightSheet').hidden)) return;
+  if (USE_NATIVE) markNightsDirty(); // the browser's live night is shown from memory, the app's is read again
+  renderWeek(USE_NATIVE);
+}, 60000);
 
 // Android Back button (called by MainActivity): close the top screen; false = nothing to close
 window.handleBack = () => {
