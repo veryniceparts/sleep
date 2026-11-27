@@ -1757,12 +1757,14 @@ class NightView {
     this.recalc();
     this.rowMark = null;
     if (this.onDataChanged) this.onDataChanged();
+    this.updatePlayer(); // ⏮/⏭ depend on the sounds
     this.requestDraw();
   }
   setCategory(c) {
     this.cat = this.cat === c ? null : c;
     this.rowMark = null;
     if (this.onDataChanged) this.onDataChanged();
+    this.updatePlayer();
     this.draw();
   }
   // what the list, the markers and prev/next work on: all loud sounds, one category, or snoring sessions
