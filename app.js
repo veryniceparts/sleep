@@ -1822,7 +1822,8 @@ class NightView {
   endOf(c) { return c.start + c.duration * 1000; }
   list(mode = this.mode) { return mode === 'seg' ? this.segs : this.clips; }
   item() { return this.mode ? this.list()[this.cur] || null : null; }
-  pos() { return this.fixing ? this.pendingOffset : this.audio.currentTime || 0; }
+  // until the requested position has been applied (new file still loading, or webm being fixed) report that position
+  pos() { return this.fixing || this.pending ? this.pendingOffset : this.audio.currentTime || 0; }
   curT() { const it = this.item(); return it ? it.start + this.pos() * 1000 : null; }
   segAt(t) { return this.segs.findIndex((g) => t >= g.start && t < this.endOf(g)); }
 
@@ -1877,10 +1878,10 @@ class NightView {
     openViews.forEach((v) => v !== this && v.pause());
     const a = this.audio, tok = ++this.tok;
     offset = Math.max(0, Math.min(offset, it.duration - 0.2));
-    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false;
+    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false; this.pending = true;
     const seekTo = () => {
       if (tok !== this.tok) return;
-      if (Number.isFinite(a.duration)) { a.currentTime = offset; return; }
+      if (Number.isFinite(a.duration)) { a.currentTime = offset; this.pending = false; return; }
       // Files from MediaRecorder (webm) have no duration in their header, so the browser can't seek.
       // Jumping to the end once makes it scan the file; then seeking works.
       this.fixing = true; a.muted = true;
@@ -1888,7 +1889,7 @@ class NightView {
         if (tok !== this.tok) { a.removeEventListener('durationchange', done); return; }
         if (!Number.isFinite(a.duration)) return;
         a.removeEventListener('durationchange', done);
-        a.currentTime = offset; a.muted = false; this.fixing = false;
+        a.currentTime = offset; a.muted = false; this.fixing = false; this.pending = false;
         // resume (the jump to the end may have stopped it) — unless the user paused meanwhile
         if (this.userPaused) { if (!a.paused) a.pause(); this.ui.play.textContent = '▶'; this.draw(); }
         else if (a.paused) a.play().catch(() => {});
@@ -1993,7 +1994,7 @@ class NightView {
   stopAudio() {
     this.pause(); this.tok++;
     this.audio.removeAttribute('src'); this.audio.load();
-    this.mode = null; this.cur = -1; this.loadedId = null; this.fixing = false;
+    this.mode = null; this.cur = -1; this.loadedId = null; this.fixing = false; this.pending = false;
     this.markRows();
   }
 
