@@ -1733,7 +1733,7 @@ class NightView {
   destroy() {
     // stop for good, also mid-way through the webm 'fixing' step (which would otherwise resume playback)
     this.stopAudio();
-    cancelAnimationFrame(this.raf);
+    cancelAnimationFrame(this.raf); clearTimeout(this.msgTimer);
     this.cancelled = true;
     if (this.onDestroy) this.onDestroy();
     if (this.ac) this.ac.close().catch(() => {});
@@ -1864,12 +1864,28 @@ class NightView {
     const gi = this.segAt(t);
     if (gi >= 0) return this.playItem('seg', gi, (t - this.segs[gi].start) / 1000);
     if (clipIdx < 0) clipIdx = this.clips.findIndex((c) => t >= c.start - 2000 && t <= this.endOf(c));
+    // only clips saved this night (no whole-night files): play the clip nearest to t
+    if (clipIdx < 0 && !this.segs.length) clipIdx = this.nearestClip(t);
     if (clipIdx >= 0) {
       const c = this.clips[clipIdx];
       this.playItem('clip', clipIdx, t >= c.start && t <= this.endOf(c) ? (t - c.start) / 1000 : 0);
     } else {
-      this.ui.title.textContent = `No audio saved at ${fmtTime(t)}`;
+      this.flash(`No audio saved at ${fmtTime(t)}`);
     }
+  }
+
+  nearestClip(t) {
+    let best = -1, bestD = Infinity;
+    this.clips.forEach((c, i) => { const d = t < c.start ? c.start - t : t > this.endOf(c) ? t - this.endOf(c) : 0; if (d < bestD) { bestD = d; best = i; } });
+    return best;
+  }
+
+  // a short message in the player's title that the per-frame updates leave alone for a few seconds
+  flash(text, ms = 3000) {
+    this.msg = { text, until: performance.now() + ms };
+    this.updatePlayer();
+    clearTimeout(this.msgTimer);
+    this.msgTimer = setTimeout(() => this.updatePlayer(), ms + 50);
   }
 
   playItem(mode, i, offset = 0) {
@@ -1878,7 +1894,7 @@ class NightView {
     openViews.forEach((v) => v !== this && v.pause());
     const a = this.audio, tok = ++this.tok;
     offset = Math.max(0, Math.min(offset, it.duration - 0.2));
-    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false; this.pending = true;
+    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false; this.pending = true; this.msg = null;
     const seekTo = () => {
       if (tok !== this.tok) return;
       if (Number.isFinite(a.duration)) { a.currentTime = offset; this.pending = false; return; }
@@ -2035,6 +2051,7 @@ class NightView {
     if (u.time.textContent !== tt) { u.time.textContent = tt; u.seek.title = `${clock(t0)} – ${clock(end)}`; }
     let title;
     if (this.scrubT != null) title = `Release to play from ${fmtTime(t)}`;
+    else if (this.msg && performance.now() < this.msg.until) title = this.msg.text;
     else if (!it) {
       title = this.segs.length ? 'Tap the graph to listen to any moment'
         : this.clips.length ? 'Tap the graph or a clip to play' : 'No audio saved this night';
@@ -2182,7 +2199,7 @@ class NightView {
     const r = this.catAt(t);
     if (r) html += `<br><span style="color:${CATS[r.c].color}">● ${r.c === 'other' ? r.l : CATS[r.c].name}</span>`;
     if (this.segAt(t) >= 0) html += '<br><b>Tap to listen</b>';
-    else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
+    else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : !this.segs.length && this.clips.length ? '<br><b>Tap to play the nearest clip</b>' : '<br><span class="muted">no recording here</span>';
     this.tip.innerHTML = html;
     this.tip.style.left = `${Math.max(70, Math.min(this.width() - 70, x))}px`;
     this.tip.hidden = false;
@@ -2202,8 +2219,8 @@ class NightView {
     this.lastTap = { at: now, x };
     this.selSound = this.soundList().find((s) => t >= s.s - 1000 && t <= s.e + 1000) || null;
     const ci = this.clipAt(x);
-    if (this.segAt(t) >= 0 || ci >= 0) {
-      this.playAt(t, ci);
+    if (this.segAt(t) >= 0 || ci >= 0 || (!this.segs.length && this.clips.length)) {
+      this.playAt(t, ci); // (clips-only night: the nearest clip)
       this.tip.hidden = true;
     } else {
       this.showTip(x);
