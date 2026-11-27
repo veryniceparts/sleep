@@ -1793,13 +1793,21 @@ class NightView {
         this.ac = new AC();
         const src = this.ac.createMediaElementSource(this.audio);
         this.gain = this.ac.createGain();
-        const lim = this.ac.createDynamicsCompressor();
+        const lim = this.lim = this.ac.createDynamicsCompressor();
         lim.threshold.value = -6; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.003; lim.release.value = 0.2;
-        src.connect(this.gain); this.gain.connect(lim); lim.connect(this.ac.destination);
+        src.connect(this.gain); lim.connect(this.ac.destination);
+        this.limOn = null;
       } catch (e) { console.warn('boost unavailable', e); this.ac = null; return; }
     }
     if (this.ac.state === 'suspended') this.ac.resume().catch(() => {});
     this.gain.gain.value = this.boost;
+    // the limiter is only needed when amplifying; at ×1 it would just colour the sound
+    const on = this.boost > 1;
+    if (on !== this.limOn) {
+      this.limOn = on;
+      try { this.gain.disconnect(); } catch {}
+      this.gain.connect(on ? this.lim : this.ac.destination);
+    }
   }
 
   async reload() {
