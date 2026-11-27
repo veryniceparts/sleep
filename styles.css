@@ -140,14 +140,15 @@ canvas { display: block; }
 .s-tip { position: absolute; top: 6px; transform: translateX(-50%); background: rgba(11,15,23,.92); border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 8px; font-size: .78rem; white-space: nowrap; pointer-events: none; z-index: 2; }
 .s-tip b { color: var(--clip); }
-.player { position: sticky; bottom: 0; z-index: 3; display: flex; align-items: center; gap: 6px;
+.player { position: sticky; bottom: 0; z-index: 3; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; padding: 6px; margin: 10px 0 0; }
 .player > button { padding: 8px 10px; min-width: 40px; }
 .p-info { flex: 1; min-width: 0; }
 .p-title { font-size: .8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.p-bar { display: flex; align-items: center; gap: 8px; }
-.p-seek { flex: 1; min-width: 0; accent-color: var(--clip); }
-.p-time { font-variant-numeric: tabular-nums; font-size: .75rem; }
+/* the seek bar gets its own full-width row so long clock labels (12-hour, other locales) never squeeze it */
+.p-bar { flex: 1 0 100%; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.p-seek { flex: 1; min-width: 120px; margin: 0 4px; accent-color: var(--clip); }
+.p-time { flex: none; font-variant-numeric: tabular-nums; font-size: .75rem; white-space: nowrap; padding-right: 4px; }
 .list-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 7px 0; border-top: 1px solid var(--border); font-size: .88rem; }
 .list-item button { padding: 4px 9px; font-size: .8rem; }
 .list-item.clickable { cursor: pointer; }
@@ -195,7 +196,7 @@ canvas { display: block; }
 .night-ph .ph-line { flex: 0 0 14px; width: 70%; border-radius: 6px; }
 .night-ph .ph-tools { flex: 0 0 30px; width: 60%; }
 .night-ph .ph-chart { flex: 1 1 auto; min-height: 120px; background: var(--panel2); }
-.night-ph .ph-player { flex: 0 0 52px; }
+.night-ph .ph-player { flex: 0 0 78px; }
 .night-ph .ph-list { flex: 0 0 clamp(170px, 34vh, 320px); flex: 0 0 clamp(170px, 34dvh, 320px); }
 @keyframes ph-pulse { from { opacity: .55; } to { opacity: 1; } }
 #nightBody.sheet-body { padding-bottom: calc(env(safe-area-inset-bottom) + 10px); }

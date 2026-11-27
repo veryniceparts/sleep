@@ -1194,10 +1194,14 @@ async function mountNight(el, src) {
     view.markRows();
   };
   // tap = play (zoom unchanged); double tap = zoom in on that sound
-  let lastRow = null, lastRowAt = 0;
+  let lastRow = null, lastRowAt = 0, downAt = null;
+  // a swipe that starts on a row (switches the day) is not a tap: mouse swipes still end in a click
+  sndBox.addEventListener('pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY }; });
   sndBox.onclick = (e) => {
     const r = e.target.closest('.snd-row');
-    if (!r) return;
+    const moved = downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 10;
+    downAt = null;
+    if (!r || moved) return;
     const x = shown[+r.dataset.i], now = performance.now();
     if (lastRow === x && now - lastRowAt < 400) { view.focusSound(x); lastRow = null; return; }
     lastRow = x; lastRowAt = now;
@@ -1909,9 +1913,9 @@ class NightView {
     };
     this.ui.boost.classList.toggle('on', this.boost > 1);
 
-    q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
-    q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
-    q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.requestDraw(); };
+    q('.z-in').onclick = () => { this.userView(); this.zoomAt(this.center(), 0.5); };
+    q('.z-out').onclick = () => { this.userView(); this.zoomAt(this.center(), 2); };
+    q('.z-all').onclick = () => { this.userView(); this.v0 = this.t0; this.v1 = this.tEnd(); this.requestDraw(); };
     this.ui.play.onclick = () => this.toggle();
     this.ui.prev.onclick = () => this.jump(-1);
     this.ui.next.onclick = () => this.jump(1);
@@ -1926,6 +1930,14 @@ class NightView {
       this.playAt(t); // (says so in the title if there is no audio at that moment)
       this.requestDraw();
     };
+    // no 'change' comes when the thumb is released where the drag started, or when the drag is cancelled:
+    // end the preview then (after any 'change' of this release has run) so the bar never stays frozen
+    const endScrub = () => setTimeout(() => {
+      if (this.scrubT == null) return;
+      this.scrubT = null;
+      this.updatePlayer(); this.requestDraw();
+    }, 0);
+    for (const ev of ['pointerup', 'pointercancel', 'touchend', 'touchcancel', 'lostpointercapture', 'blur']) this.ui.seek.addEventListener(ev, endScrub);
     this.audio.addEventListener('play', () => { this.ui.play.textContent = '⏸'; this.loop(); });
     this.audio.addEventListener('pause', () => { if (!this.fixing) this.ui.play.textContent = '▶'; this.draw(); });
     this.audio.addEventListener('ended', () => this.onEnded());
@@ -1954,7 +1966,9 @@ class NightView {
   }
 
   destroy() {
-    this.pause();
+    // stop for good, also mid-way through the webm 'fixing' step (which would otherwise resume playback)
+    this.stopAudio();
+    cancelAnimationFrame(this.raf); clearTimeout(this.msgTimer);
     this.cancelled = true;
     if (this.onDestroy) this.onDestroy();
     if (this.ac) this.ac.close().catch(() => {});
@@ -1978,12 +1992,14 @@ class NightView {
     this.recalc();
     this.rowMark = null;
     if (this.onDataChanged) this.onDataChanged();
+    this.updatePlayer(); // ⏮/⏭ depend on the sounds
     this.requestDraw();
   }
   setCategory(c) {
     this.cat = this.cat === c ? null : c;
     this.rowMark = null;
     if (this.onDataChanged) this.onDataChanged();
+    this.updatePlayer();
     this.draw();
   }
   // what the list, the markers and prev/next work on: all loud sounds, one category, or snoring sessions
@@ -2012,13 +2028,21 @@ class NightView {
         this.ac = new AC();
         const src = this.ac.createMediaElementSource(this.audio);
         this.gain = this.ac.createGain();
-        const lim = this.ac.createDynamicsCompressor();
+        const lim = this.lim = this.ac.createDynamicsCompressor();
         lim.threshold.value = -6; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.003; lim.release.value = 0.2;
-        src.connect(this.gain); this.gain.connect(lim); lim.connect(this.ac.destination);
+        src.connect(this.gain); lim.connect(this.ac.destination);
+        this.limOn = null;
       } catch (e) { console.warn('boost unavailable', e); this.ac = null; return; }
     }
     if (this.ac.state === 'suspended') this.ac.resume().catch(() => {});
     this.gain.gain.value = this.boost;
+    // the limiter is only needed when amplifying; at ×1 it would just colour the sound
+    const on = this.boost > 1;
+    if (on !== this.limOn) {
+      this.limOn = on;
+      try { this.gain.disconnect(); } catch {}
+      this.gain.connect(on ? this.lim : this.ac.destination);
+    }
   }
 
   async reload() {
@@ -2043,7 +2067,8 @@ class NightView {
   endOf(c) { return c.start + c.duration * 1000; }
   list(mode = this.mode) { return mode === 'seg' ? this.segs : this.clips; }
   item() { return this.mode ? this.list()[this.cur] || null : null; }
-  pos() { return this.fixing ? this.pendingOffset : this.audio.currentTime || 0; }
+  // until the requested position has been applied (new file still loading, or webm being fixed) report that position
+  pos() { return this.fixing || this.pending ? this.pendingOffset : this.audio.currentTime || 0; }
   curT() { const it = this.item(); return it ? it.start + this.pos() * 1000 : null; }
   segAt(t) { return this.segs.findIndex((g) => t >= g.start && t < this.endOf(g)); }
 
@@ -2060,6 +2085,9 @@ class NightView {
     const r = (t - b0) / (b1 - b0);
     this.setView(t - r * span, t - r * span + span);
   }
+
+  // the user moved the view: playback doesn't pull it back for a few seconds
+  userView() { this.userViewAt = performance.now(); }
 
   ensureVisible(t) {
     if (t >= this.v0 && t <= this.v1) return;
@@ -2081,12 +2109,28 @@ class NightView {
     const gi = this.segAt(t);
     if (gi >= 0) return this.playItem('seg', gi, (t - this.segs[gi].start) / 1000);
     if (clipIdx < 0) clipIdx = this.clips.findIndex((c) => t >= c.start - 2000 && t <= this.endOf(c));
+    // only clips saved this night (no whole-night files): play the clip nearest to t
+    if (clipIdx < 0 && !this.segs.length) clipIdx = this.nearestClip(t);
     if (clipIdx >= 0) {
       const c = this.clips[clipIdx];
       this.playItem('clip', clipIdx, t >= c.start && t <= this.endOf(c) ? (t - c.start) / 1000 : 0);
     } else {
-      this.ui.title.textContent = `No audio saved at ${fmtTime(t)}`;
+      this.flash(`No audio saved at ${fmtTime(t)}`);
     }
+  }
+
+  nearestClip(t) {
+    let best = -1, bestD = Infinity;
+    this.clips.forEach((c, i) => { const d = t < c.start ? c.start - t : t > this.endOf(c) ? t - this.endOf(c) : 0; if (d < bestD) { bestD = d; best = i; } });
+    return best;
+  }
+
+  // a short message in the player's title that the per-frame updates leave alone for a few seconds
+  flash(text, ms = 3000) {
+    this.msg = { text, until: performance.now() + ms };
+    this.updatePlayer();
+    clearTimeout(this.msgTimer);
+    this.msgTimer = setTimeout(() => this.updatePlayer(), ms + 50);
   }
 
   playItem(mode, i, offset = 0) {
@@ -2095,18 +2139,21 @@ class NightView {
     openViews.forEach((v) => v !== this && v.pause());
     const a = this.audio, tok = ++this.tok;
     offset = Math.max(0, Math.min(offset, it.duration - 0.2));
-    this.mode = mode; this.cur = i; this.pendingOffset = offset;
+    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false; this.pending = true; this.msg = null;
     const seekTo = () => {
       if (tok !== this.tok) return;
-      if (Number.isFinite(a.duration)) { a.currentTime = offset; return; }
+      if (Number.isFinite(a.duration)) { a.currentTime = offset; this.pending = false; return; }
       // Files from MediaRecorder (webm) have no duration in their header, so the browser can't seek.
       // Jumping to the end once makes it scan the file; then seeking works.
       this.fixing = true; a.muted = true;
       const done = () => {
-        if (!Number.isFinite(a.duration) || tok !== this.tok) return;
+        if (tok !== this.tok) { a.removeEventListener('durationchange', done); return; }
+        if (!Number.isFinite(a.duration)) return;
         a.removeEventListener('durationchange', done);
-        a.currentTime = offset; a.muted = false; this.fixing = false;
-        if (a.paused) a.play().catch(() => {});
+        a.currentTime = offset; a.muted = false; this.fixing = false; this.pending = false;
+        // resume (the jump to the end may have stopped it) — unless the user paused meanwhile
+        if (this.userPaused) { if (!a.paused) a.pause(); this.ui.play.textContent = '▶'; this.draw(); }
+        else if (a.paused) a.play().catch(() => {});
       };
       a.addEventListener('durationchange', done);
       a.currentTime = 1e101;
@@ -2140,14 +2187,25 @@ class NightView {
       else if (this.clips.length) this.play(0);
       return;
     }
-    if (this.audio.paused) this.audio.play().catch(() => {}); else this.audio.pause();
+    // during the webm 'fixing' step the element may be paused/playing muted on its own: go by what the user asked for
+    const resume = this.fixing ? this.userPaused : this.audio.paused;
+    if (resume) { this.userPaused = false; this.ui.play.textContent = '⏸'; if (this.audio.paused) this.audio.play().catch(() => {}); }
+    else this.pause();
   }
 
-  pause() { if (!this.audio.paused) this.audio.pause(); }
+  pause() {
+    this.userPaused = true;
+    if (!this.audio.paused) this.audio.pause();
+    if (this.fixing) this.ui.play.textContent = '▶';
+  }
 
   // previous / next loud sound (of the selected category)
   targetSound(dir) {
     const list = this.soundList(), t = this.curT();
+    // step from the selected sound while we're playing it (playback starts 1.5 s before a sound, so going by time alone
+    // would find the same sound again)
+    const k = this.selSound ? list.indexOf(this.selSound) : -1;
+    if (k >= 0 && (t === null || (t >= this.selSound.s - 3000 && t <= this.selSound.e + 1000))) return list[k + dir] || null;
     if (t === null) return dir > 0 ? list[0] || null : null;
     if (dir > 0) return list.find((x) => x.s > t + 1000) || null;
     for (let i = list.length - 1; i >= 0; i--) if (list[i].s < t - 3000) return list[i];
@@ -2197,7 +2255,7 @@ class NightView {
   stopAudio() {
     this.pause(); this.tok++;
     this.audio.removeAttribute('src'); this.audio.load();
-    this.mode = null; this.cur = -1; this.loadedId = null; this.fixing = false;
+    this.mode = null; this.cur = -1; this.loadedId = null; this.fixing = false; this.pending = false;
     this.markRows();
   }
 
@@ -2233,10 +2291,12 @@ class NightView {
       const sv = String(t === null ? 0 : Math.round(Math.min(1, Math.max(0, (t - t0) / (end - t0))) * 1000));
       if (u.seek.value !== sv) u.seek.value = sv;
     }
-    const tt = `${hm(t === null ? t0 : t)} / ${hm(end)}`;
-    if (u.time.textContent !== tt) u.time.textContent = tt;
+    const clock = (x) => new Date(x).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); // "9:05 PM", not "09:05 PM"
+    const tt = `${clock(t === null ? t0 : t)} / ${clock(end)}`;
+    if (u.time.textContent !== tt) { u.time.textContent = tt; u.seek.title = `${clock(t0)} – ${clock(end)}`; }
     let title;
     if (this.scrubT != null) title = `Release to play from ${fmtTime(t)}`;
+    else if (this.msg && performance.now() < this.msg.until) title = this.msg.text;
     else if (!it) {
       title = this.segs.length ? 'Tap the graph to listen to any moment'
         : this.clips.length ? 'Tap the graph or a clip to play' : 'No audio saved this night';
@@ -2251,13 +2311,17 @@ class NightView {
 
   loop() {
     cancelAnimationFrame(this.raf);
+    this.lastT = null;
     const step = () => {
       if (this.audio.paused && !this.fixing) return;
       const t = this.curT();
-      if (t !== null && (t > this.v1 || t < this.v0)) {
-        // follow the playhead when it runs off the visible part of the graph
+      // follow the playhead when playback runs off the right edge of the graph — but not while (or just after)
+      // the user pans or zooms, and not when they moved the view away from the playhead on purpose
+      const busy = this.touching || performance.now() - (this.userViewAt || 0) < 4000;
+      if (t !== null && !busy && this.lastT != null && this.lastT >= this.v0 && this.lastT <= this.v1 && t > this.v1) {
         const sp = this.v1 - this.v0; this.setView(t - sp * 0.1, t + sp * 0.9);
       }
+      this.lastT = t;
       this.draw(); this.updatePlayer(); this.markRows();
       this.raf = requestAnimationFrame(step);
     };
@@ -2273,6 +2337,7 @@ class NightView {
     cv.addEventListener('pointerdown', (e) => {
       cv.setPointerCapture(e.pointerId);
       pts.set(e.pointerId, xy(e));
+      this.touching = true; this.userView();
       if (pts.size === 1) drag = { x: xy(e), v0: this.v0, v1: this.v1, moved: false };
       else if (pts.size === 2) {
         const [a, b] = [...pts.values()];
@@ -2284,6 +2349,7 @@ class NightView {
       const x = xy(e);
       if (!pts.has(e.pointerId)) { if (e.pointerType === 'mouse') this.showTip(x); return; }
       pts.set(e.pointerId, x);
+      this.userView();
       if (pinch && pts.size === 2) {
         const [a, b] = [...pts.values()];
         this.zoomAt(pinch.mid, pinch.d / Math.max(20, Math.abs(a - b)), pinch.base);
@@ -2303,12 +2369,14 @@ class NightView {
       if (drag && !drag.moved && e.type === 'pointerup') this.tap(xy(e));
       if (pts.size < 2) pinch = null;
       drag = null;
+      this.touching = pts.size > 0; this.userView();
     };
     cv.addEventListener('pointerup', up);
     cv.addEventListener('pointercancel', up);
     cv.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !pts.size) this.tip.hidden = true; });
     cv.addEventListener('wheel', (e) => {
       e.preventDefault();
+      this.userView();
       this.zoomAt(this.tAt(xy(e)), e.deltaY > 0 ? 1.25 : 0.8);
       this.showTip(xy(e));
     }, { passive: false });
@@ -2376,7 +2444,7 @@ class NightView {
     const r = this.catAt(t);
     if (r) html += `<br><span style="color:${CATS[r.c].color}">● ${r.c === 'other' ? r.l : CATS[r.c].name}</span>`;
     if (this.segAt(t) >= 0) html += '<br><b>Tap to listen</b>';
-    else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : '<br><span class="muted">no recording here</span>';
+    else html += ci >= 0 ? `<br><b>Clip ${ci + 1}: tap to play</b>` : !this.segs.length && this.clips.length ? '<br><b>Tap to play the nearest clip</b>' : '<br><span class="muted">no recording here</span>';
     this.tip.innerHTML = html;
     this.tip.style.left = `${Math.max(70, Math.min(this.width() - 70, x))}px`;
     this.tip.hidden = false;
@@ -2396,8 +2464,8 @@ class NightView {
     this.lastTap = { at: now, x };
     this.selSound = this.soundList().find((s) => t >= s.s - 1000 && t <= s.e + 1000) || null;
     const ci = this.clipAt(x);
-    if (this.segAt(t) >= 0 || ci >= 0) {
-      this.playAt(t, ci);
+    if (this.segAt(t) >= 0 || ci >= 0 || (!this.segs.length && this.clips.length)) {
+      this.playAt(t, ci); // (clips-only night: the nearest clip)
       this.tip.hidden = true;
     } else {
       this.showTip(x);
