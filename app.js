@@ -1731,7 +1731,9 @@ class NightView {
   }
 
   destroy() {
-    this.pause();
+    // stop for good, also mid-way through the webm 'fixing' step (which would otherwise resume playback)
+    this.stopAudio();
+    cancelAnimationFrame(this.raf);
     this.cancelled = true;
     if (this.onDestroy) this.onDestroy();
     if (this.ac) this.ac.close().catch(() => {});
@@ -1875,7 +1877,7 @@ class NightView {
     openViews.forEach((v) => v !== this && v.pause());
     const a = this.audio, tok = ++this.tok;
     offset = Math.max(0, Math.min(offset, it.duration - 0.2));
-    this.mode = mode; this.cur = i; this.pendingOffset = offset;
+    this.mode = mode; this.cur = i; this.pendingOffset = offset; this.userPaused = false;
     const seekTo = () => {
       if (tok !== this.tok) return;
       if (Number.isFinite(a.duration)) { a.currentTime = offset; return; }
@@ -1883,10 +1885,13 @@ class NightView {
       // Jumping to the end once makes it scan the file; then seeking works.
       this.fixing = true; a.muted = true;
       const done = () => {
-        if (!Number.isFinite(a.duration) || tok !== this.tok) return;
+        if (tok !== this.tok) { a.removeEventListener('durationchange', done); return; }
+        if (!Number.isFinite(a.duration)) return;
         a.removeEventListener('durationchange', done);
         a.currentTime = offset; a.muted = false; this.fixing = false;
-        if (a.paused) a.play().catch(() => {});
+        // resume (the jump to the end may have stopped it) — unless the user paused meanwhile
+        if (this.userPaused) { if (!a.paused) a.pause(); this.ui.play.textContent = '▶'; this.draw(); }
+        else if (a.paused) a.play().catch(() => {});
       };
       a.addEventListener('durationchange', done);
       a.currentTime = 1e101;
@@ -1920,10 +1925,17 @@ class NightView {
       else if (this.clips.length) this.play(0);
       return;
     }
-    if (this.audio.paused) this.audio.play().catch(() => {}); else this.audio.pause();
+    // during the webm 'fixing' step the element may be paused/playing muted on its own: go by what the user asked for
+    const resume = this.fixing ? this.userPaused : this.audio.paused;
+    if (resume) { this.userPaused = false; this.ui.play.textContent = '⏸'; if (this.audio.paused) this.audio.play().catch(() => {}); }
+    else this.pause();
   }
 
-  pause() { if (!this.audio.paused) this.audio.pause(); }
+  pause() {
+    this.userPaused = true;
+    if (!this.audio.paused) this.audio.pause();
+    if (this.fixing) this.ui.play.textContent = '▶';
+  }
 
   // previous / next loud sound (of the selected category)
   targetSound(dir) {
