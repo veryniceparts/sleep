@@ -57,10 +57,12 @@ function saveSettings() {
 
 // ---------------------------------------------------------------- storage (IndexedDB)
 const DB = (() => {
+  // The connection is opened once and reused, but the browser can drop it (iOS: "Connection to Indexed Database
+  // server lost", storage cleared, a newer version opened elsewhere): then it is forgotten and opened again.
   let dbp;
   function open() {
     if (dbp) return dbp;
-    dbp = new Promise((resolve, reject) => {
+    const p = dbp = new Promise((resolve, reject) => {
       const req = indexedDB.open('sleepmon', 2);
       req.onupgradeneeded = (e) => {
         const db = req.result;
@@ -74,20 +76,41 @@ const DB = (() => {
           segs.createIndex('sessionId', 'sessionId');
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onclose = () => forget(p);
+        db.onversionchange = () => { forget(p); db.close(); };
+        resolve(db);
+      };
       req.onerror = () => reject(req.error);
     });
-    return dbp;
+    p.catch(() => forget(p)); // a failed open is tried again next time
+    return p;
   }
-  async function tx(store, mode, fn) {
-    const db = await open();
+  function forget(p) { if (dbp === p) dbp = null; }
+  // errors that mean the connection itself is gone (not e.g. a full disk): reconnect and try once more
+  const lostConnection = (e) => !!e && (e.name === 'InvalidStateError' || e.name === 'UnknownError' || /connection|closing|closed/i.test(e.message || ''))
+    && e.name !== 'QuotaExceededError';
+  async function tx(store, mode, fn, retry = true) {
+    const conn = open();
+    try {
+      return await run(await conn, store, mode, fn);
+    } catch (e) {
+      if (!retry || !lostConnection(e)) throw e;
+      forget(conn);
+      console.warn('IndexedDB connection lost, reopening', e);
+      return tx(store, mode, fn, false);
+    }
+  }
+  function run(db, store, mode, fn) {
     return new Promise((resolve, reject) => {
       const t = db.transaction(store, mode);
       const s = t.objectStore(store);
       const p = Promise.resolve(fn(s));
+      p.catch(() => {}); // reported through the transaction below
       t.oncomplete = () => p.then(resolve, reject);
       t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error);
+      t.onabort = () => reject(t.error || new DOMException('The transaction was aborted', 'AbortError'));
     });
   }
   const reqP = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -95,6 +118,14 @@ const DB = (() => {
     putSession: (s) => tx('sessions', 'readwrite', (st) => { st.put(s); }),
     putClip: (c) => tx('clips', 'readwrite', (st) => { st.put(c); }),
     getSessions: () => tx('sessions', 'readonly', (st) => reqP(st.getAll())),
+    getSession: (id) => tx('sessions', 'readonly', (st) => reqP(st.get(id))),
+    // change a stored night in place (read + write in one transaction, so nothing written meanwhile is lost);
+    // does nothing if the night no longer exists (deleted). Resolves to the updated night or null.
+    updateSession: (id, change) => tx('sessions', 'readwrite', (st) => new Promise((res, rej) => {
+      const r = st.get(id);
+      r.onsuccess = () => { const cur = r.result; if (!cur) { res(null); return; } change(cur); st.put(cur); res(cur); };
+      r.onerror = () => rej(r.error);
+    })),
     getClips: (sessionId) => tx('clips', 'readonly', (st) => reqP(st.index('sessionId').getAll(sessionId))),
     deleteClip: (id) => tx('clips', 'readwrite', (st) => { st.delete(id); }),
     putSegment: (g) => tx('segments', 'readwrite', (st) => { st.put(g); }),
@@ -161,6 +192,12 @@ const WebMonitor = {
   secMax: 0, secSamples: 0,  // per-second level aggregation for the night graph
   saveTimer: null,
   seg: null, segTimer: null,  // whole-night recording
+  saveErrors: 0, saveErr: null, lastPersistOk: null, // storage failures during this night (shown in the status)
+
+  noteSaveError(what, e) {
+    console.error(what + ' failed', e);
+    this.saveErrors++; this.saveErr = e;
+  },
 
   async start({ record = settings.recordAll } = {}) {
     if (this.running) return;
@@ -217,6 +254,7 @@ const WebMonitor = {
 
   async startInner(record) {
     this.micLost = false; this.micMuted = false;
+    this.saveErrors = 0; this.saveErr = null; this.lastPersistOk = null;
     this.stream = await this.getMic();
     this.watchMic(this.stream);
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -282,7 +320,7 @@ const WebMonitor = {
       if (g.saved) return;
       g.meta.duration = +((Date.now() - g.start) / 1000).toFixed(1); g.meta.size = g.size;
       if (!g.session.segments.includes(g.meta)) g.session.segments.push(g.meta);
-      DB.putSegment({ ...g.meta, sessionId: g.session.id, blob: new Blob(g.chunks, { type: g.mime }) }).catch(() => {});
+      DB.putSegment({ ...g.meta, sessionId: g.session.id, blob: new Blob(g.chunks, { type: g.mime }) }).catch((e) => this.noteSaveError('recording save', e));
     };
     rec.onstart = () => { g.start = g.meta.start = Date.now(); };
     rec.onerror = (e) => { console.warn('recorder error', e); if (this.seg === g && this.running) this.rotateSegment(); };
@@ -312,9 +350,12 @@ const WebMonitor = {
     delete meta.partial;
     if (!g.session.segments.includes(meta)) g.session.segments.push(meta);
     try {
+      if (g.session !== this.session && Recog.deleted.has(g.session.id)) return; // finished late, night already deleted
       await DB.putSegment({ ...meta, sessionId: g.session.id, blob });
-      await DB.putSession(g.session);
-    } catch (e) { console.error('segment save failed', e); meta.saveError = true; }
+      // after Stop only the file list is written (the night may have been changed or deleted meanwhile)
+      if (g.session === this.session) await DB.putSession(g.session);
+      else await DB.updateSession(g.session.id, (cur) => { cur.segments = g.session.segments; });
+    } catch (e) { this.noteSaveError('segment save', e); meta.saveError = true; }
     if (g.live) LiveRecog.add(g.live, meta, blob); // (also after Stop, if this file finished late)
   },
 
@@ -338,6 +379,7 @@ const WebMonitor = {
     this.stream.getTracks().forEach((t) => t.stop());
     capped(this.ctx.close(), 2000).catch(() => {});
     this.session.end = Date.now();
+    this.lastPersistOk = null; // stays null if the final save doesn't even answer
     await capped(this.persist(), 4000);
     const s = this.session;
     this.session = null;
@@ -347,7 +389,7 @@ const WebMonitor = {
   persist() {
     if (!this.session) return Promise.resolve();
     this.session.end = Date.now();
-    return DB.putSession(this.session).catch((e) => console.error('save failed', e));
+    return DB.putSession(this.session).then(() => { this.lastPersistOk = true; }, (e) => { this.lastPersistOk = false; this.noteSaveError('save', e); });
   },
 
   process(input, rate) {
@@ -413,10 +455,10 @@ const WebMonitor = {
     this.persist(); // record the clip in the night right away, even if storing its audio is slow
     return DB.putClip({ ...meta, sessionId: session.id, blob })
       .catch((e) => {
-        console.error('clip save failed', e);
+        this.noteSaveError('clip save', e);
         meta.saveError = true;
       })
-      .then(() => DB.putSession(session).catch(() => {}));
+      .then(() => DB.putSession(session).catch((e) => this.noteSaveError('save', e)));
   },
 };
 
@@ -706,7 +748,7 @@ function updateStatus() {
   if (Monitor.saving) { setText('stState', 'Saving the night…'); setText('stInfo', 'Writing the last recording, a few seconds'); return; }
   if (calib) { state = 'Stay quiet…'; info = 'Measuring the room for 10 s'; }
   else if (s) {
-    state = Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound'
+    state = Monitor.saveErrors ? '⚠ Not saving – storage full or unavailable' : Monitor.micLost ? '⚠ Microphone lost, reconnecting…' : Monitor.micMuted ? '⚠ Microphone paused by the system' : Monitor.clip ? '● Recording sound'
       : wakeWarn && !USE_NATIVE ? '⚠ Keep the screen on' : 'Monitoring';
     $('stState').title = wakeWarn && !USE_NATIVE ? 'This browser can\'t keep the screen on. If the screen locks, recording stops: keep it on (plugged in) and this page open.' : '';
     info = `${fmtDur(Date.now() - s.start)} · ${plural(s.clips.length, 'loud sound')}`;
@@ -740,6 +782,7 @@ $('btnToggle').onclick = async () => {
   b.disabled = true;
   try {
     if (!Monitor.running) {
+      if (!(await storageOk())) return; // nearly full storage: the user decided not to start
       monitorStarting = true; // a preview still waiting for the microphone (permission prompt) gives up
       try {
         if (Preview.starting) await Preview.starting.catch(() => {});
@@ -766,7 +809,13 @@ $('btnToggle').onclick = async () => {
       markNightsDirty();
       setRunningUI(false);
       allowSleep();
-      if (s) lastSaved = `Saved ${fmtDur(s.end - s.start)} · ${s.clips.length} loud sounds`;
+      if (s) {
+        const what = `${fmtDur(s.end - s.start)} · ${plural(s.clips.length, 'loud sound')}`;
+        // only say "Saved" when it was: storage errors are reported honestly
+        if (Monitor === WebMonitor && WebMonitor.lastPersistOk !== true) lastSaved = `⚠ Not saved (${WebMonitor.saveErr ? WebMonitor.saveErr.message || WebMonitor.saveErr.name : 'storage did not respond'}) · ${what}`;
+        else if (Monitor === WebMonitor && WebMonitor.saveErrors) lastSaved = `⚠ Saved ${what}, but some audio could not be stored (storage full?)`;
+        else lastSaved = `Saved ${what}`;
+      }
       startPreview();
       await renderWeek();
       autoRecognise();
@@ -781,6 +830,19 @@ $('btnToggle').onclick = async () => {
 function exitNightMode() {
   $('nightOverlay').hidden = true; clearInterval(nightClockTimer);
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+
+// before a browser recording: warn if the storage is nearly full (the recording could not be saved)
+async function storageOk() {
+  if (USE_NATIVE || !navigator.storage || !navigator.storage.estimate) return true;
+  let est;
+  try { est = await navigator.storage.estimate(); } catch { return true; }
+  if (!est || !est.quota) return true;
+  const free = est.quota - (est.usage || 0), need = settings.recordAll ? 150e6 : 20e6; // whole night: ~14 MB per hour
+  if (free >= need) return true;
+  return confirm(`Only ${fmtMB(Math.max(0, free))} of storage space is left for this app` +
+    (settings.recordAll ? ' (the whole-night recording needs about 14 MB per hour)' : '') +
+    '. The night may not be saved completely. Free up space (e.g. delete old nights or full recordings) — start anyway?');
 }
 
 // monitoring was stopped from the notification's Stop button
@@ -1030,22 +1092,30 @@ function idbSource(s) {
   const live = Monitor === WebMonitor && WebMonitor.session && WebMonitor.session.id === s.id;
   if (live) s = WebMonitor.session; // show the latest data of a night still being recorded
   if (!s.segments) s.segments = [];
-  return {
+  const src = {
     s, live, native: false,
+    // always the stored night as it is now (e.g. analysed meanwhile), not the copy this source was made from
     async load() {
-      const [c, g] = await Promise.all([DB.getClips(s.id), DB.getSegments(s.id)]);
+      const [fresh, c, g] = await Promise.all([live ? null : DB.getSession(s.id), DB.getClips(s.id), DB.getSegments(s.id)]);
+      if (!live) {
+        if (!fresh) throw new Error('this night was deleted');
+        if (!fresh.segments) fresh.segments = [];
+        s = src.s = fresh;
+      }
       return { s, clips: c.sort(byStart), segs: g.sort(byStart) };
     },
     async deleteClip(c) {
       await DB.deleteClip(c.id);
       s.clips = s.clips.filter((x) => x.id !== c.id);
-      if (!live) await DB.putSession(s);
+      if (!live) await DB.updateSession(s.id, (cur) => { cur.clips = (cur.clips || []).filter((x) => x.id !== c.id); });
     },
-    async deleteFull() { await DB.deleteSegments(s.id); s.segments = []; await DB.putSession(s); },
-    deleteSession: () => DB.deleteSession(s.id),
-    async saveAnalysis(a) { s.analysis = a; if (!live) await DB.putSession(s); },
+    async deleteFull() { await DB.deleteSegments(s.id); s.segments = []; await DB.updateSession(s.id, (cur) => { cur.segments = []; }); },
+    async deleteSession() { Recog.cancel(s.id); await DB.deleteSession(s.id); Recog.deleted.add(s.id); },
+    // only the analysis is written: the rest of the stored night may have changed (or it was deleted) meanwhile
+    async saveAnalysis(a) { s.analysis = a; if (!live) await DB.updateSession(s.id, (cur) => { cur.analysis = a; }); },
     save: (items) => downloadMany(items.map((i) => ({ blob: i.item.blob, name: i.name }))),
   };
+  return src;
 }
 
 function nativeSource(s) {
@@ -1060,8 +1130,12 @@ function nativeSource(s) {
     },
     async deleteClip(c) { await SR.deleteClip({ sessionId: s.id, clipId: c.id }); src.s.clips = src.s.clips.filter((x) => x.id !== c.id); },
     async deleteFull() { await SR.deleteFull({ sessionId: s.id }); src.s.segments = []; },
-    async saveAnalysis(a) { await SR.saveAnalysis({ sessionId: s.id, analysis: a }); src.s.analysis = a; },
-    deleteSession: () => SR.deleteSession({ id: s.id }),
+    async saveAnalysis(a) {
+      if (Recog.deleted.has(s.id)) return; // deleted while it was being analysed
+      await SR.saveAnalysis({ sessionId: s.id, analysis: a }); src.s.analysis = a;
+    },
+    // (rejects with "still being saved" while the recorder is still writing this night: then nothing changes)
+    async deleteSession() { Recog.cancel(s.id); await SR.deleteSession({ id: s.id }); Recog.deleted.add(s.id); },
     save: (items) => SR.share({ files: items.map((i) => ({ path: i.item.path, name: i.name })) }).catch((e) => alert(e.message)),
   };
   return src;
@@ -1185,14 +1259,15 @@ async function mountNight(el, src) {
   };
   el.querySelector('.btn-delfull').onclick = async () => {
     if (!confirm(`Delete the whole-night recording (${fmtMB(segBytes(view.s))})? Saved clips and the graph are kept.`)) return;
-    await src.deleteFull();
+    Recog.cancel(view.s.id); // its audio is going away
+    try { await src.deleteFull(); } catch (e) { alert('Could not delete the recording: ' + (e.message || e)); return; }
     view.clearSegments();
     renderSummary();
   };
   el.querySelector('.btn-del').onclick = async () => {
     if (live) { alert('Stop monitoring first.'); return; }
     if (!confirm('Delete this whole night, including all clips and the full recording?')) return;
-    await src.deleteSession();
+    try { await src.deleteSession(); } catch (e) { alert('Could not delete this night: ' + (e.message || e)); return; }
     closeSheets();
   };
   return view;
@@ -1316,8 +1391,10 @@ async function renderWeek(reload = true) {
   sum.className = 'tile summary';
   const hours = inWeek.reduce((t, n) => t + (nightEnd(n) - n.s.start), 0) / 3600e3;
   const nights = new Set(inWeek.map((n) => nightDay(n.s.start))).size;
-  const analysed = inWeek.filter((n) => snoreMs(n.s) !== null);
-  const snoreAvg = analysed.length ? analysed.reduce((t, n) => t + snoreMs(n.s), 0) / analysed.length : null;
+  // snoring per night (all recordings of the same night added up), averaged over the analysed nights
+  const snorePerNight = new Map();
+  inWeek.forEach((n) => { const ms = snoreMs(n.s); if (ms !== null) { const d = nightDay(n.s.start); snorePerNight.set(d, (snorePerNight.get(d) || 0) + ms); } });
+  const snoreAvg = snorePerNight.size ? [...snorePerNight.values()].reduce((t, ms) => t + ms, 0) / snorePerNight.size : null;
   sum.innerHTML = `<div class="t-day"><span>Week</span></div>` +
     `<div><b>${nights}</b> night${nights === 1 ? '' : 's'}</div>` +
     `<div class="muted">${hours ? `${(hours / Math.max(1, nights)).toFixed(1)} h avg` : '—'}</div>` +
@@ -1463,16 +1540,21 @@ const MP_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@${MP_VERSION
 const YAMNET_URL = 'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite';
 const ANALYSIS_VERSION = 2; // 2: background skipped (nights analysed with v1 are redone)
 
-// Our categories, the YAMNet labels that map to them, and how they are shown
+// Our categories, the YAMNet labels that map to them (exact class names from the model's label list; the
+// Android SoundRecognizer uses the same lists), and how they are shown
 const CATS = {
-  snore: { name: 'Snoring', color: '#b48cff', re: /^(Snoring|Snort)$/ },
-  gasp: { name: 'Gasp / wheeze', color: '#ff5c6c', re: /^(Gasp|Wheeze|Pant|Choking)$/ },
-  cough: { name: 'Cough', color: '#ff9f43', re: /^(Cough|Throat clearing|Sneeze|Sniff|Hiccup)$/ },
-  breath: { name: 'Breathing', color: '#4fd1c5', re: /^(Breathing|Sigh)$/ },
-  talk: { name: 'Talking', color: '#ffd166', re: /speech|Speech|Conversation|Narration|Whispering|Babbling|Laughter|Groan|Grunt|Whimper|Shout|Yell|Crying|Humming|Singing/ },
-  move: { name: 'Movement', color: '#9aa6bd', re: /Rustl|footsteps|Door|Knock|Tap|Thump|Bang|Creak|Squeak|Zipper|Scratch|Clatter|Rub|Slam|Shuffle|Clothing|Writing/i },
-  other: { name: 'Other', color: '#5f6f8f', re: null },
+  snore: { name: 'Snoring', color: '#b48cff', labels: ['Snoring', 'Snort'] },
+  gasp: { name: 'Gasp / wheeze', color: '#ff5c6c', labels: ['Gasp', 'Wheeze', 'Pant'] },
+  cough: { name: 'Cough', color: '#ff9f43', labels: ['Cough', 'Throat clearing', 'Sneeze', 'Sniff', 'Hiccup'] },
+  breath: { name: 'Breathing', color: '#4fd1c5', labels: ['Breathing', 'Sigh'] },
+  talk: { name: 'Talking', color: '#ffd166', labels: ['Speech', 'Child speech, kid speaking', 'Conversation', 'Narration, monologue', 'Babbling',
+    'Whispering', 'Shout', 'Yell', 'Laughter', 'Crying, sobbing', 'Whimper', 'Wail, moan', 'Groan', 'Grunt', 'Singing', 'Humming',
+    'Hubbub, speech noise, speech babble'] },
+  move: { name: 'Movement', color: '#9aa6bd', labels: ['Rustle', 'Rustling leaves', 'Shuffle', 'Walk, footsteps', 'Door', 'Sliding door', 'Knock',
+    'Slam', 'Tap', 'Thump, thud', 'Bang', 'Creak', 'Squeak', 'Zipper (clothing)', 'Scratch', 'Rub', 'Clatter', 'Writing'] },
+  other: { name: 'Other', color: '#5f6f8f', labels: [] },
 };
+const LABEL_CAT = new Map(Object.entries(CATS).flatMap(([k, c]) => c.labels.map((l) => [l, k])));
 const CAT_ORDER = ['snore', 'gasp', 'cough', 'talk', 'breath', 'move', 'other'];
 // sleep-relevant sounds win when the model hears several things in the same second
 const CAT_WEIGHT = { snore: 1.4, gasp: 1.5, cough: 1.3, talk: 1.1, breath: 1, move: 1, other: 1 };
@@ -1483,7 +1565,7 @@ function pickCategory(categories) {
   let best = null;
   for (const c of categories) {
     if (c.score < 0.1) continue;
-    const key = CAT_ORDER.find((k) => CATS[k].re && CATS[k].re.test(c.categoryName));
+    const key = LABEL_CAT.get(c.categoryName);
     if (!key) continue;
     const w = c.score * CAT_WEIGHT[key];
     if (!best || w > best.w) best = { c: key, p: c.score, w, l: c.categoryName };
@@ -1563,17 +1645,18 @@ const Analyzer = {
       return out;
     });
     const total = plan.reduce((n, p) => n + p.reduce((m, [a, b]) => m + (b - a), 0), 0) || 1;
-    let done = 0;
+    let done = 0, tried = 0, failed = 0;
     const wins = [];
     for (let k = 0; k < items.length; k++) {
       const it = items[k];
       if (!plan[k].length) continue; // nothing but background in this file: don't even decode it
       if (cancelled()) return null;
+      tried++;
       let buf;
       try {
         const ab = it.blob ? await it.blob.arrayBuffer() : await (await fetch(it.src)).arrayBuffer();
         buf = await ctx.decodeAudioData(ab);
-      } catch (e) { console.warn('could not decode', it.id, e); done += plan[k].reduce((m, [a, b]) => m + (b - a), 0); continue; }
+      } catch (e) { console.warn('could not decode', it.id, e); failed++; done += plan[k].reduce((m, [a, b]) => m + (b - a), 0); continue; }
       const data = buf.getChannelData(0), rate = buf.sampleRate, win = Math.round((W / 1000) * rate), chunk = win * stepWins; // small steps keep the screen smooth
       for (const [a, b] of plan[k]) {
         const end = Math.min(data.length, Math.round((b / 1000) * rate));
@@ -1582,10 +1665,10 @@ const Analyzer = {
           const part = data.subarray(off, Math.min(end, off + chunk));
           if (part.length < win / 2) { done += (part.length / rate) * 1000; break; }
           const res = clf.classify(part, rate);
-          const step = res.length ? (part.length / rate) * 1000 / res.length : 975;
+          // every result is one YAMNet window of W ms (also in a short last chunk, which has fewer of them)
           res.forEach((r, i) => {
             const pick = pickCategory(r.classifications[0] ? r.classifications[0].categories : []);
-            if (pick) wins.push({ t: it.start + (off / rate) * 1000 + (r.timestampMs ?? i * step), d: step, ...pick });
+            if (pick) wins.push({ t: it.start + (off / rate) * 1000 + (r.timestampMs ?? i * W), d: W, ...pick });
           });
           done += (part.length / rate) * 1000;
           onProgress(Math.min(1, done / total));
@@ -1593,6 +1676,9 @@ const Analyzer = {
         }
       }
     }
+    // audio that can't be read is not "no sounds": fail (nothing is saved, the night is tried again later)
+    // instead of storing an empty result, when all or most of it was unreadable
+    if (failed && failed * 2 > tried) throw new Error(`could not read the audio (${failed} of ${tried} file${tried === 1 ? '' : 's'})`);
     return wins;
   },
 };
@@ -1631,8 +1717,8 @@ const LiveRecog = {
         const wins = await Analyzer.analyzeWins([{ ...meta, blob }], () => {}, () => false, activeSpans(L.session), 2);
         L.wins.push(...wins);
         if (L.finished) { // a file that finished after Stop: update the stored final result
-          L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
-          await DB.putSession(L.session).catch(() => {});
+          const a = L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
+          await DB.updateSession(L.session.id, (cur) => { cur.analysis = a; }).catch(() => {});
           return;
         }
         L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), partial: true, runs: mergeRuns(L.wins.slice()) };
@@ -1649,13 +1735,21 @@ const LiveRecog = {
     const p = L.queue.then(async () => {
       if (L.failed) return;
       L.finished = true;
-      L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
-      await DB.putSession(L.session).catch(() => {});
+      const a = L.session.analysis = { v: ANALYSIS_VERSION, at: Date.now(), runs: mergeRuns(L.wins.slice()) };
+      // only the analysis: the night may have been deleted (or changed) since it was recorded
+      await DB.updateSession(id, (cur) => { cur.analysis = a; }).catch(() => {});
     }).finally(() => this.pending.delete(id));
     this.pending.set(id, p);
     return p;
   },
 };
+
+// What to analyse: the whole-night files, plus the clips from parts of the night they don't cover
+// (e.g. the whole-night recording was switched on late, paused, or a file was lost)
+function recogItems(segs, clips) {
+  const covered = (c) => segs.some((g) => c.start >= g.start && c.start + c.duration * 1000 <= g.start + g.duration * 1000 + 1000);
+  return [...segs, ...clips.filter((c) => !covered(c))].sort(byStart);
+}
 
 // Background recognition: one night at a time; progress can be shown by the night view and the week grid.
 const Recog = {
@@ -1677,18 +1771,30 @@ const Recog = {
       if (!loaded) loaded = await src.load(); // fresh data: it may have been analysed meanwhile
       if (!Recog.needs(loaded.s)) { src.s.analysis = job.result = loaded.s.analysis; return; }
       const d = loaded;
-      const items = d.segs.length ? d.segs : d.clips;
+      const items = recogItems(d.segs, d.clips);
+      if (!items.length) { job.noAudio = true; Recog.markNoAudio(src.s); }
       if (job.cancelled) return;
       const res = items.length ? await Analyzer.analyze(items, (f) => { job.progress = f; notify(); }, () => job.cancelled, activeSpans(d.s)) : null;
-      if (res) {
+      if (res && !job.cancelled && !Recog.deleted.has(id)) {
         await src.saveAnalysis(res).catch((e) => console.warn('analysis not saved', e));
         src.s.analysis = res;
       }
       job.result = res;
     }).catch((e) => { console.warn('recognition failed', e); job.error = e; })
-      .finally(() => { this.jobs.delete(id); job.done = true; notify(); });
+      .finally(() => {
+        // the week grid may have been reloaded while this ran: update the night there too, so its tile is current
+        if (job.result) allNights.forEach((n) => { if (n.s.id === id) n.s.analysis = job.result; });
+        this.jobs.delete(id); job.done = true; notify();
+      });
     return job;
   },
+  deleted: new Set(), // nights deleted in this session: never save an analysis for them
+  // nights whose stored audio is missing (key: id + how many files it lists), so they aren't picked again
+  noAudioKey: (s) => `${s.id}:${(s.segments || []).length}:${(s.clips || []).length}`,
+  noAudio() { try { return JSON.parse(lsGet('sleepmon.noAudio') || '[]'); } catch { return []; } },
+  markNoAudio(s) { const k = this.noAudioKey(s), l = this.noAudio(); if (!l.includes(k)) lsSet('sleepmon.noAudio', JSON.stringify([...l, k].slice(-50))); },
+  tried: new Set(),   // nights the automatic recognition already worked on since the app started
+  cancel(id) { const job = this.jobs.get(id); if (job) job.cancelled = true; },
   // stop all analysis (e.g. a recording starts: it must get the CPU)
   cancelAll() {
     this.jobs.forEach((job) => { job.cancelled = true; });
@@ -1696,12 +1802,26 @@ const Recog = {
 };
 
 // After a night ends, recognise its sounds in the background (newest unanalysed night of the last 3 days)
+// One night at a time; when it ends the next one is taken. A night without usable audio (or whose recognition
+// failed) is not picked again, so it can't hold up the others.
 function autoRecognise() {
   if (Monitor.running) return; // don't compete with a recording
+  if ([...Recog.jobs.values()].some((j) => j.auto)) return; // already working through them
+  const noAudio = Recog.noAudio();
   const cand = allNights
-    .filter((n) => !n.live && Recog.needs(n.s) && Date.now() - n.s.start < 3 * 864e5 && ((n.s.segments || []).length || (n.s.clips || []).length))
+    .filter((n) => !n.live && Recog.needs(n.s) && Date.now() - n.s.start < 3 * 864e5 && ((n.s.segments || []).length || (n.s.clips || []).length) &&
+      !Recog.tried.has(n.s.id) && !Recog.deleted.has(n.s.id) && !noAudio.includes(Recog.noAudioKey(n.s)))
     .sort((a, b) => b.s.start - a.s.start)[0];
-  if (cand) { Recog.run(cand); renderWeek(false); }
+  if (!cand) return;
+  Recog.tried.add(cand.s.id);
+  const job = Recog.run(cand);
+  job.auto = true;
+  job.listeners.add((j) => {
+    if (!j.done) return;
+    if (j.cancelled) Recog.tried.delete(cand.s.id); // paused (e.g. a recording started): picked again later
+    else setTimeout(autoRecognise, 0);
+  });
+  renderWeek(false);
 }
 
 // Snoring sessions: loud snores (above the night's threshold) no more than `maxGap` seconds apart
