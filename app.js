@@ -1026,10 +1026,14 @@ async function mountNight(el, src) {
     view.markRows();
   };
   // tap = play (zoom unchanged); double tap = zoom in on that sound
-  let lastRow = null, lastRowAt = 0;
+  let lastRow = null, lastRowAt = 0, downAt = null;
+  // a swipe that starts on a row (switches the day) is not a tap: mouse swipes still end in a click
+  sndBox.addEventListener('pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY }; });
   sndBox.onclick = (e) => {
     const r = e.target.closest('.snd-row');
-    if (!r) return;
+    const moved = downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 10;
+    downAt = null;
+    if (!r || moved) return;
     const x = shown[+r.dataset.i], now = performance.now();
     if (lastRow === x && now - lastRowAt < 400) { view.focusSound(x); lastRow = null; return; }
     lastRow = x; lastRowAt = now;
