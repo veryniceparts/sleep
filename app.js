@@ -1678,9 +1678,9 @@ class NightView {
     };
     this.ui.boost.classList.toggle('on', this.boost > 1);
 
-    q('.z-in').onclick = () => this.zoomAt(this.center(), 0.5);
-    q('.z-out').onclick = () => this.zoomAt(this.center(), 2);
-    q('.z-all').onclick = () => { this.v0 = this.t0; this.v1 = this.tEnd(); this.requestDraw(); };
+    q('.z-in').onclick = () => { this.userView(); this.zoomAt(this.center(), 0.5); };
+    q('.z-out').onclick = () => { this.userView(); this.zoomAt(this.center(), 2); };
+    q('.z-all').onclick = () => { this.userView(); this.v0 = this.t0; this.v1 = this.tEnd(); this.requestDraw(); };
     this.ui.play.onclick = () => this.toggle();
     this.ui.prev.onclick = () => this.jump(-1);
     this.ui.next.onclick = () => this.jump(1);
@@ -1837,6 +1837,9 @@ class NightView {
     const r = (t - b0) / (b1 - b0);
     this.setView(t - r * span, t - r * span + span);
   }
+
+  // the user moved the view: playback doesn't pull it back for a few seconds
+  userView() { this.userViewAt = performance.now(); }
 
   ensureVisible(t) {
     if (t >= this.v0 && t <= this.v1) return;
@@ -2029,13 +2032,17 @@ class NightView {
 
   loop() {
     cancelAnimationFrame(this.raf);
+    this.lastT = null;
     const step = () => {
       if (this.audio.paused && !this.fixing) return;
       const t = this.curT();
-      if (t !== null && (t > this.v1 || t < this.v0)) {
-        // follow the playhead when it runs off the visible part of the graph
+      // follow the playhead when playback runs off the right edge of the graph — but not while (or just after)
+      // the user pans or zooms, and not when they moved the view away from the playhead on purpose
+      const busy = this.touching || performance.now() - (this.userViewAt || 0) < 4000;
+      if (t !== null && !busy && this.lastT != null && this.lastT >= this.v0 && this.lastT <= this.v1 && t > this.v1) {
         const sp = this.v1 - this.v0; this.setView(t - sp * 0.1, t + sp * 0.9);
       }
+      this.lastT = t;
       this.draw(); this.updatePlayer(); this.markRows();
       this.raf = requestAnimationFrame(step);
     };
@@ -2051,6 +2058,7 @@ class NightView {
     cv.addEventListener('pointerdown', (e) => {
       cv.setPointerCapture(e.pointerId);
       pts.set(e.pointerId, xy(e));
+      this.touching = true; this.userView();
       if (pts.size === 1) drag = { x: xy(e), v0: this.v0, v1: this.v1, moved: false };
       else if (pts.size === 2) {
         const [a, b] = [...pts.values()];
@@ -2062,6 +2070,7 @@ class NightView {
       const x = xy(e);
       if (!pts.has(e.pointerId)) { if (e.pointerType === 'mouse') this.showTip(x); return; }
       pts.set(e.pointerId, x);
+      this.userView();
       if (pinch && pts.size === 2) {
         const [a, b] = [...pts.values()];
         this.zoomAt(pinch.mid, pinch.d / Math.max(20, Math.abs(a - b)), pinch.base);
@@ -2081,12 +2090,14 @@ class NightView {
       if (drag && !drag.moved && e.type === 'pointerup') this.tap(xy(e));
       if (pts.size < 2) pinch = null;
       drag = null;
+      this.touching = pts.size > 0; this.userView();
     };
     cv.addEventListener('pointerup', up);
     cv.addEventListener('pointercancel', up);
     cv.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !pts.size) this.tip.hidden = true; });
     cv.addEventListener('wheel', (e) => {
       e.preventDefault();
+      this.userView();
       this.zoomAt(this.tAt(xy(e)), e.deltaY > 0 ? 1.25 : 0.8);
       this.showTip(xy(e));
     }, { passive: false });
