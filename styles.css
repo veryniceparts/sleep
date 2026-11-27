@@ -247,6 +247,15 @@ canvas { display: block; }
   .toggle { padding: 9px; font-size: 1rem; }
   .s-lists, .night-ph .ph-list { flex-basis: clamp(76px, 28vh, 170px); }
   .session .chart-box, .night-ph .ph-chart { min-height: 60px; }
+  /* little height: slimmer player */
+  .player { padding: 4px 6px; gap: 4px; margin-top: 4px; }
+  .player > button { padding: 5px 8px; }
+  .night-ph .ph-player { flex-basis: 52px; }
+}
+/* short but wide (landscape): the seek bar fits next to the buttons again, saving a row */
+@media (max-height: 500px) and (min-aspect-ratio: 4/3) {
+  .p-bar { flex: 1 1 160px; }
+  .night-ph .ph-player { flex-basis: 40px; }
 }
 /* wide and short (landscape phone): monitor on the left, week on the right */
 @media (max-height: 500px) and (min-aspect-ratio: 4/3) {

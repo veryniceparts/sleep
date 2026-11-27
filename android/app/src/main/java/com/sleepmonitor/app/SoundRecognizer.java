@@ -8,7 +8,6 @@ import org.json.JSONObject;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.regex.Pattern;
 
 /**
  * Recognises sounds while the night is being recorded, with the same model (YAMNet) and the same rules as
@@ -38,15 +37,17 @@ final class SoundRecognizer {
 
     // our categories (CATS / CAT_ORDER / CAT_WEIGHT in app.js; 'other' has no pattern)
     static final String[] CAT_ORDER = { "snore", "gasp", "cough", "talk", "breath", "move", "other" };
-    private static final Pattern[] CAT_RE = {
-            Pattern.compile("^(Snoring|Snort)$"),
-            Pattern.compile("^(Gasp|Wheeze|Pant|Choking)$"),
-            Pattern.compile("^(Cough|Throat clearing|Sneeze|Sniff|Hiccup)$"),
-            Pattern.compile("speech|Speech|Conversation|Narration|Whispering|Babbling|Laughter|Groan|Grunt|Whimper|Shout|Yell|Crying|Humming|Singing"),
-            Pattern.compile("^(Breathing|Sigh)$"),
-            Pattern.compile("Rustl|footsteps|Door|Knock|Tap|Thump|Bang|Creak|Squeak|Zipper|Scratch|Clatter|Rub|Slam|Shuffle|Clothing|Writing", Pattern.CASE_INSENSITIVE),
-            null,
-    };
+    // exact YAMNet label names per category, in CAT_ORDER (same lists as CATS[k].labels in app.js)
+    private static java.util.Set<String> set(String... names) { return new java.util.HashSet<>(java.util.Arrays.asList(names)); }
+    private static final java.util.List<java.util.Set<String>> CAT_LABELS = java.util.Arrays.asList(
+            set("Snoring", "Snort"),
+            set("Gasp", "Wheeze", "Pant"),
+            set("Cough", "Throat clearing", "Sneeze", "Sniff", "Hiccup"),
+            set("Speech", "Child speech, kid speaking", "Conversation", "Narration, monologue", "Babbling", "Whispering", "Shout", "Yell", "Laughter", "Crying, sobbing", "Whimper", "Wail, moan", "Groan", "Grunt", "Singing", "Humming", "Hubbub, speech noise, speech babble"),
+            set("Breathing", "Sigh"),
+            set("Rustle", "Rustling leaves", "Shuffle", "Walk, footsteps", "Door", "Sliding door", "Knock", "Slam", "Tap", "Thump, thud", "Bang", "Creak", "Squeak", "Zipper (clothing)", "Scratch", "Rub", "Clatter", "Writing"),
+            null // other: any label that isn't Silence and scores >= 0.3
+    );
     private static final double[] CAT_WEIGHT = { 1.4, 1.5, 1.3, 1.1, 1, 1, 1 };
     private static final int OTHER = 6;
 
@@ -316,8 +317,8 @@ final class SoundRecognizer {
         int[] out = new int[labels.length];
         for (int i = 0; i < labels.length; i++) {
             out[i] = -1;
-            for (int k = 0; k < CAT_RE.length; k++) {
-                if (CAT_RE[k] != null && CAT_RE[k].matcher(labels[i]).find()) { out[i] = k; break; }
+            for (int k = 0; k < CAT_LABELS.size(); k++) {
+                if (CAT_LABELS.get(k) != null && CAT_LABELS.get(k).contains(labels[i])) { out[i] = k; break; }
             }
         }
         return out;
